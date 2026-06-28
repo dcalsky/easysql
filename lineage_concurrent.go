@@ -6,11 +6,7 @@
 
 package easysql
 
-import (
-	"sync"
-
-	polyglot "github.com/tobilg/polyglot/packages/go"
-)
+import "sync"
 
 // SourceTableColumnsConcurrent is a drop-in alternative to SourceTableColumns
 // that analyzes the leaf SELECTs of a set operation (UNION / INTERSECT /
@@ -37,7 +33,11 @@ import (
 // operations.
 const maxLineageConcurrency = 4
 
-func SourceTableColumnsConcurrent(client *polyglot.Client, sql string, opts ...LineageOption) (map[string][]string, error) {
+func SourceTableColumnsConcurrent(sql string, opts ...LineageOption) (map[string][]string, error) {
+	client, err := defaultClient()
+	if err != nil {
+		return nil, err
+	}
 	req, err := prepareLineage(client, sql, opts...)
 	if err != nil {
 		return nil, err

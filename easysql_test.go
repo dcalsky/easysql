@@ -21,16 +21,16 @@ const (
 )
 
 func TestMain(m *testing.M) {
-	c, err := OpenBundledClient()
+	// Initialize (and capture) the shared engine the same way the public API
+	// does; tests also use this client directly for AST assertions.
+	c, err := defaultClient()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "skipping easysql tests: polyglot FFI library not available:", err)
 		fmt.Fprintln(os.Stderr, "ensure the matching .ffi/ artifact for this platform is present to run them")
 		os.Exit(0)
 	}
 	testClient = c
-	code := m.Run()
-	_ = c.Close()
-	os.Exit(code)
+	os.Exit(m.Run())
 }
 
 // --- structural validators -------------------------------------------------
@@ -103,7 +103,7 @@ func walkJSON(node any, fn func(map[string]any)) {
 func rewriteValid(t *testing.T, dialect, sql, whereClause, marker string, wantWraps int, opts ...Option) string {
 	t.Helper()
 	all := append([]Option{WithDialect(dialect)}, opts...)
-	out, err := ApplyRowFilter(testClient, sql, whereClause, all...)
+	out, err := ApplyRowFilter(sql, whereClause, all...)
 	if err != nil {
 		t.Fatalf("ApplyRowFilter(%q): %v", sql, err)
 	}
@@ -255,7 +255,7 @@ func TestErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := ApplyRowFilter(testClient, tc.sql, testWhere)
+			_, err := ApplyRowFilter(tc.sql, testWhere)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("ApplyRowFilter(%q) error = %v, want %v", tc.sql, err, tc.want)
 			}
@@ -277,7 +277,7 @@ func TestConfigValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := ApplyRowFilter(testClient, "select * from a", tc.where, tc.opts...); err == nil {
+			if _, err := ApplyRowFilter("select * from a", tc.where, tc.opts...); err == nil {
 				t.Fatalf("ApplyRowFilter(where=%q) succeeded, want error", tc.where)
 			}
 		})
@@ -292,7 +292,7 @@ func TestSelfCheck(t *testing.T) {
 		"select * from a union select * from b",
 		"with c as (select * from a) select * from c",
 	} {
-		if _, err := ApplyRowFilter(testClient, sql, testWhere, WithSelfCheck(true)); err != nil {
+		if _, err := ApplyRowFilter(sql, testWhere, WithSelfCheck(true)); err != nil {
 			t.Fatalf("self-check rewrite %q: %v", sql, err)
 		}
 	}

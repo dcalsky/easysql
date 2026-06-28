@@ -132,7 +132,7 @@ func TestInnerQueryNonQueryStatementsReturnNil(t *testing.T) {
 				t.Fatalf("innerQuery(%q) = non-nil; want nil for a statement with no query", tc.sql)
 			}
 
-			got, err := SourceTableColumns(testClient, tc.sql,
+			got, err := SourceTableColumns(tc.sql,
 				WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata))
 			if err != nil {
 				t.Fatalf("SourceTableColumns(%q): %v", tc.sql, err)
@@ -203,7 +203,7 @@ func TestInnerQueryUnwrapCoverage(t *testing.T) {
 			}
 			t.Logf("unwrapped body: %s", innerSQL)
 
-			got, err := SourceTableColumns(testClient, tc.sql,
+			got, err := SourceTableColumns(tc.sql,
 				WithLineageDialect(tc.dialect), WithLineageMetadata(trinoMetadata))
 			if err != nil {
 				t.Fatalf("SourceTableColumns [%s] %q: %v", tc.dialect, tc.sql, err)
@@ -248,7 +248,7 @@ func TestInnerQueryUnsupportedShapes(t *testing.T) {
 			if _, found := innerQueryFound(t, tc.dialect, tc.sql); found {
 				t.Fatalf("innerQuery unexpectedly unwrapped %s; update the coverage tests", tc.name)
 			}
-			got, err := SourceTableColumns(testClient, tc.sql,
+			got, err := SourceTableColumns(tc.sql,
 				WithLineageDialect(tc.dialect), WithLineageMetadata(trinoMetadata))
 			if err != nil {
 				t.Fatalf("SourceTableColumns [%s] %q: %v", tc.dialect, tc.sql, err)

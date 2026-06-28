@@ -67,12 +67,12 @@ func benchCases() []struct {
 func TestSourceTableColumnsConcurrentMatchesSerial(t *testing.T) {
 	for _, tc := range benchCases() {
 		t.Run(tc.name, func(t *testing.T) {
-			serial, err := SourceTableColumns(testClient, tc.sql,
+			serial, err := SourceTableColumns(tc.sql,
 				WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata))
 			if err != nil {
 				t.Fatalf("serial: %v", err)
 			}
-			concurrent, err := SourceTableColumnsConcurrent(testClient, tc.sql,
+			concurrent, err := SourceTableColumnsConcurrent(tc.sql,
 				WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata))
 			if err != nil {
 				t.Fatalf("concurrent: %v", err)
@@ -97,7 +97,7 @@ func BenchmarkLineageSerialVsConcurrent(b *testing.B) {
 		b.Run("serial/"+tc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, err := SourceTableColumns(testClient, tc.sql,
+				if _, err := SourceTableColumns(tc.sql,
 					WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata)); err != nil {
 					b.Fatal(err)
 				}
@@ -106,7 +106,7 @@ func BenchmarkLineageSerialVsConcurrent(b *testing.B) {
 		b.Run("concurrent/"+tc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, err := SourceTableColumnsConcurrent(testClient, tc.sql,
+				if _, err := SourceTableColumnsConcurrent(tc.sql,
 					WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata)); err != nil {
 					b.Fatal(err)
 				}
