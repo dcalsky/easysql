@@ -1,0 +1,19 @@
+# Native FFI static libraries are never needed at runtime (PureGo dlopen only
+# loads the dynamic .so/.dylib/.dll). Keep them out of the repo so they can't
+# bloat history again. The dynamic libraries under .ffi/ are intentionally NOT
+# ignored — they ship with the module.
+/.ffi/**/*.a
+/.ffi/**/*.lib
+
+# Go build/test artifacts
+*.test
+*.out
+
+# Python leftovers (the old python/ port is gone)
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS / editor junk
+.DS_Store
