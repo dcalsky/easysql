@@ -6,9 +6,9 @@ import (
 	polyglot "github.com/tobilg/polyglot/packages/go"
 )
 
-// TestBundledFFIVersionMatchesSDK guards the core invariant enforced by
-// OpenBundledClient: the bundled native library's version must equal the pinned
-// polyglot Go SDK version (the one in go.mod). If this fails, the .ffi/
+// TestBundledFFIVersionMatchesSDK guards the core invariant enforced when the
+// bundled client is opened: the bundled native library's version must equal the
+// pinned polyglot Go SDK version (the one in go.mod). If this fails, the .ffi/
 // artifacts are out of sync with the SDK and must be re-vendored to match.
 func TestBundledFFIVersionMatchesSDK(t *testing.T) {
 	got, err := testClient.RuntimeVersion()

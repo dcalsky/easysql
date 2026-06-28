@@ -106,8 +106,13 @@ func WithLineageMetadata(metadata map[string][]string) LineageOption {
 // It is the Go equivalent of the Python `get_source_table_columns`. The result
 // keys are the fully-qualified table names as resolved by the analyzer (e.g.
 // "hive.raw.orders"); every source table appears in the map even when no column
-// flows from it. The caller owns the polyglot client's lifecycle.
-func SourceTableColumns(client *polyglot.Client, sql string, opts ...LineageOption) (map[string][]string, error) {
+// flows from it. The native SQL engine is loaded automatically on first use
+// (see Init), so no setup is required.
+func SourceTableColumns(sql string, opts ...LineageOption) (map[string][]string, error) {
+	client, err := defaultClient()
+	if err != nil {
+		return nil, err
+	}
 	req, err := prepareLineage(client, sql, opts...)
 	if err != nil {
 		return nil, err

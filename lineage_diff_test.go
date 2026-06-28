@@ -43,7 +43,7 @@ func BenchmarkSourceTableColumns(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		q := queries[i%len(queries)]
-		if _, err := SourceTableColumns(testClient, q.SQL,
+		if _, err := SourceTableColumns(q.SQL,
 			WithLineageDialect("trino"), WithLineageMetadata(metadata)); err != nil {
 			b.Fatalf("%s: %v", q.Name, err)
 		}
@@ -62,7 +62,7 @@ func BenchmarkSourceTableColumnsParallel(b *testing.B) {
 		for pb.Next() {
 			q := queries[i%len(queries)]
 			i++
-			if _, err := SourceTableColumns(testClient, q.SQL,
+			if _, err := SourceTableColumns(q.SQL,
 				WithLineageDialect("trino"), WithLineageMetadata(metadata)); err != nil {
 				b.Fatalf("%s: %v", q.Name, err)
 			}
@@ -82,7 +82,7 @@ func TestLineageDumpForDiff(t *testing.T) {
 
 	out := map[string]any{}
 	for _, q := range queries {
-		res, err := SourceTableColumns(testClient, q.SQL,
+		res, err := SourceTableColumns(q.SQL,
 			WithLineageDialect("trino"), WithLineageMetadata(metadata))
 		if err != nil {
 			out[q.Name] = map[string]string{"__error__": err.Error()}

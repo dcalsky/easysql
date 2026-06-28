@@ -33,24 +33,28 @@ the repository's [`.ffi/`](.ffi) directory, one per platform:
 .ffi/polyglot-sql-ffi-windows-x86_64/polyglot_sql_ffi.dll
 ```
 
-`OpenBundledClient` detects the host OS/architecture (via `runtime.GOOS` /
-`runtime.GOARCH`), picks the matching `.ffi/` artifact and opens a client
-against it — no manual setup required. The library path is **fixed and not
-configurable**: only the bundled artifact is loaded, there is no environment
-override and no fallback search of arbitrary locations. If the host platform has
-no bundled artifact, `OpenBundledClient` returns an error (fail closed) rather
-than loading some other library. This keeps the loaded native code locked to the
-version this module was built against.
+There is **nothing to wire up**: the engine is loaded automatically the first
+time you call any API. The package detects the host OS/architecture (via
+`runtime.GOOS` / `runtime.GOARCH`), picks the matching `.ffi/` artifact and opens
+it once for the process. The library path is **fixed and not configurable**:
+only the bundled artifact is loaded, there is no environment override and no
+fallback search of arbitrary locations. If the host platform has no bundled
+artifact, the first call returns an error (fail closed) rather than loading some
+other library. This keeps the loaded native code locked to the version this
+module was built against.
 
-`OpenBundledClient` also verifies the loaded library's version against the pinned
-polyglot Go SDK (the version in `go.mod`) and fails closed on a mismatch — the
-native FFI and the SDK share an ABI that is only guaranteed within the same
-release. The expected version is `polyglot.Version()`, so it is impossible to
-silently drift: bump the SDK in `go.mod` and the bundled `.ffi/` artifacts must
-be re-vendored to the same version or startup errors out (the
-`TestBundledFFIVersionMatchesSDK` test guards this too). To bypass the version
-check for a deliberately hand-built library, set
+The loaded library's version is also verified against the pinned polyglot Go SDK
+(the version in `go.mod`) and fails closed on a mismatch — the native FFI and the
+SDK share an ABI that is only guaranteed within the same release. The expected
+version is `polyglot.Version()`, so it is impossible to silently drift: bump the
+SDK in `go.mod` and the bundled `.ffi/` artifacts must be re-vendored to the same
+version or it errors out (the `TestBundledFFIVersionMatchesSDK` test guards this
+too). To bypass the version check for a deliberately hand-built library, set
 `EASYSQL_SKIP_FFI_VERSION_CHECK=1` (unsupported).
+
+Initialization is lazy by default. A long-running service that prefers to fail
+fast at startup can call `easysql.Init()` once — it eagerly loads and
+version-checks the engine, is idempotent, and is safe for concurrent use.
 
 
 | GOOS / GOARCH       | `.ffi/` directory                 | Library file                |
@@ -65,18 +69,16 @@ check for a deliberately hand-built library, set
 ## Usage
 
 ```go
-client, err := easysql.OpenBundledClient() // detects OS/arch, loads from .ffi/
-if err != nil { log.Fatal(err) }
-defer client.Close()
-
-out, err := easysql.ApplyRowFilter(client, `select "uid" from a`, "user = 'alice'", easysql.WithDialect("postgres"))
+// No setup: the bundled engine loads on first use.
+out, err := easysql.ApplyRowFilter(`select "uid" from a`, "user = 'alice'", easysql.WithDialect("postgres"))
 if err != nil { log.Fatal(err) }
 // SELECT "uid" FROM (SELECT * FROM "a" WHERE user = 'alice') AS "a"
 ```
 
-`ApplyRowFilter` is a one-shot, stateless call — there is no constructor to keep around,
-mirroring `SourceTableColumns` below. It is safe for concurrent use as long as
-the underlying `*polyglot.Client` is.
+`ApplyRowFilter` is a one-shot, stateless call — there is no client to open or
+constructor to keep around, mirroring `SourceTableColumns` below. It is safe for
+concurrent use. Call `easysql.Init()` at startup if you want to validate the
+native engine eagerly instead of on first use.
 
 
 
@@ -112,7 +114,7 @@ as well as `CREATE VIEW`, `CREATE TABLE AS SELECT` and `INSERT ... SELECT`
 even when no column flows from it.
 
 ```go
-cols, err := easysql.SourceTableColumns(client, `
+cols, err := easysql.SourceTableColumns(`
     CREATE VIEW hive.analytics.v_paid_orders AS
     WITH paid_orders AS (
         SELECT o.order_id, o.user_id, p.paid_amount
@@ -213,8 +215,9 @@ responsibility.
 go test ./...
 ```
 
-Tests open the client with `OpenBundledClient`, so the matching `.ffi/` artifact
-for the host platform is loaded automatically. If no library can be resolved the
+Tests load the bundled engine the same way the API does (lazily on first use),
+so the matching `.ffi/` artifact for the host platform is loaded automatically.
+If no library can be resolved the
 tests **skip** (they do not fail), so CI without the artifact stays green.
 
 Tests are assertion-based, not "did not panic":

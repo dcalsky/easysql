@@ -119,11 +119,17 @@ func WithSelfCheck(b bool) Option { return func(o *options) { o.selfCheck = b } 
 //	SELECT * FROM a  ->  SELECT * FROM (SELECT * FROM a WHERE <whereClause>) AS a
 //
 // whereClause is a boolean SQL expression spliced verbatim as an AST node, so
-// the caller is responsible for any value binding or escaping inside it. The
-// caller owns client's lifecycle. Errors classify via errors.Is against
-// ErrParse, ErrUnsupported and ErrInternal; configuration mistakes (empty
-// whereClause, unknown dialect, bad table regexp, …) return a plain error.
-func ApplyRowFilter(client *polyglot.Client, sql, whereClause string, opts ...Option) (string, error) {
+// the caller is responsible for any value binding or escaping inside it.
+//
+// The native SQL engine is loaded automatically on first use (see Init), so no
+// setup is required. Errors classify via errors.Is against ErrParse,
+// ErrUnsupported and ErrInternal; configuration mistakes (empty whereClause,
+// unknown dialect, bad table regexp, …) return a plain error.
+func ApplyRowFilter(sql, whereClause string, opts ...Option) (string, error) {
+	client, err := defaultClient()
+	if err != nil {
+		return "", err
+	}
 	r, err := compile(client, whereClause, opts...)
 	if err != nil {
 		return "", err

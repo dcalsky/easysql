@@ -10,8 +10,9 @@
 //	.ffi/polyglot-sql-ffi-linux-x86_64/libpolyglot_sql_ffi.so
 //	...
 //
-// OpenBundledClient detects the current OS/architecture, finds the matching
-// artifact and opens a polyglot.Client against it.
+// The package loads this artifact lazily on first use (or eagerly via Init),
+// detecting the current OS/architecture and verifying its version, so callers
+// have nothing to wire up.
 
 package easysql
 
@@ -21,6 +22,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	polyglot "github.com/tobilg/polyglot/packages/go"
 )
@@ -29,13 +31,47 @@ import (
 const ffiDirName = ".ffi"
 
 // versionCheckSkipEnv, when set to a non-empty value, disables the FFI/SDK
-// version compatibility check performed by OpenBundledClient. It is an escape
-// hatch for advanced users deliberately running a hand-built or otherwise
-// non-standard native library; loading a mismatched library is unsupported and
-// may crash or produce wrong results.
+// version compatibility check performed when the bundled client is opened. It is
+// an escape hatch for advanced users deliberately running a hand-built or
+// otherwise non-standard native library; loading a mismatched library is
+// unsupported and may crash or produce wrong results.
 const versionCheckSkipEnv = "EASYSQL_SKIP_FFI_VERSION_CHECK"
 
-// OpenBundledClient opens a polyglot.Client backed by the prebuilt FFI shared
+// The process-wide SQL engine. It is opened lazily, exactly once, the first time
+// any API needs it (or eagerly via Init), and then shared by every call. The
+// native library is safe for concurrent use, so a single shared client suffices
+// and there is nothing for callers to wire up or close.
+var (
+	clientOnce   sync.Once
+	sharedClient *polyglot.Client
+	sharedErr    error
+)
+
+// Init eagerly loads and version-checks the bundled native SQL engine.
+//
+// It is optional: every API (ApplyRowFilter, SourceTableColumns, …) initializes
+// the engine lazily on first use, so the package works out of the box with no
+// setup. Init exists so a long-running service can fail fast at startup instead
+// of on its first query. It is idempotent and safe for concurrent use; repeated
+// calls return the same result.
+//
+// Only the bundled artifact for the host OS/architecture is ever loaded — the
+// path is fixed and not user-configurable — and its version must match the
+// pinned polyglot Go SDK or initialization fails closed.
+func Init() error {
+	_, err := defaultClient()
+	return err
+}
+
+// defaultClient returns the shared engine, opening it once on first use.
+func defaultClient() (*polyglot.Client, error) {
+	clientOnce.Do(func() {
+		sharedClient, sharedErr = openBundledClient()
+	})
+	return sharedClient, sharedErr
+}
+
+// openBundledClient opens a polyglot.Client backed by the prebuilt FFI shared
 // library bundled in the repository's .ffi/ directory, selected for the current
 // operating system and architecture.
 //
@@ -48,10 +84,8 @@ const versionCheckSkipEnv = "EASYSQL_SKIP_FFI_VERSION_CHECK"
 // in go.mod); a mismatch is rejected fail closed, because the native FFI and the
 // Go SDK share an ABI that is only guaranteed within the same release. Set
 // EASYSQL_SKIP_FFI_VERSION_CHECK to bypass the check (unsupported).
-//
-// The caller owns the returned client's lifecycle and must Close it.
-func OpenBundledClient() (*polyglot.Client, error) {
-	path, err := BundledFFIPath()
+func openBundledClient() (*polyglot.Client, error) {
+	path, err := bundledFFIPath()
 	if err != nil {
 		return nil, err
 	}
@@ -90,11 +124,11 @@ func verifyFFIVersion(client *polyglot.Client) error {
 	return nil
 }
 
-// BundledFFIPath returns the absolute path to the prebuilt Polyglot FFI shared
+// bundledFFIPath returns the absolute path to the prebuilt Polyglot FFI shared
 // library for the current OS/architecture inside the repository's .ffi/
 // directory. It returns an error if the host platform has no bundled artifact
 // or the .ffi/ directory cannot be located.
-func BundledFFIPath() (string, error) {
+func bundledFFIPath() (string, error) {
 	platform, err := ffiPlatformDir()
 	if err != nil {
 		return "", err

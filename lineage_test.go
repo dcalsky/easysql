@@ -28,7 +28,6 @@ var trinoMetadata = map[string][]string{
 func assertSourceTableColumns(t *testing.T, name, sql string, expected map[string][]string) {
 	t.Helper()
 	actual, err := SourceTableColumns(
-		testClient,
 		sql,
 		WithLineageDialect("trino"),
 		WithLineageMetadata(trinoMetadata),
@@ -285,12 +284,12 @@ func TestLineagePlainSelectMatchesEquivalentCreateView(t *testing.T) {
                   JOIN hive.raw.orders o ON u.user_id = o.user_id
                   WHERE o.status = 'PAID'`
 
-	plain, err := SourceTableColumns(testClient, body,
+	plain, err := SourceTableColumns(body,
 		WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata))
 	if err != nil {
 		t.Fatalf("plain select: %v", err)
 	}
-	view, err := SourceTableColumns(testClient, "CREATE VIEW hive.x.v AS "+body,
+	view, err := SourceTableColumns("CREATE VIEW hive.x.v AS "+body,
 		WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata))
 	if err != nil {
 		t.Fatalf("create view: %v", err)
