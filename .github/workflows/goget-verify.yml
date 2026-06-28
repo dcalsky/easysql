@@ -1,0 +1,38 @@
+name: go-get-verify
+
+# Proves easysql is usable with nothing but `go get`: on each supported OS the
+# bundled per-platform native engine must ship with the module and load on first
+# use. Pushes/PRs test the checked-out code via a local replace; a manual run can
+# verify an already-published version.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published version to verify (e.g. v0.1.0). Empty = test this checkout."
+        required: false
+        default: ""
+
+jobs:
+  verify:
+    name: go get (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Verify go get works (native engine loads on first use)
+        shell: bash
+        env:
+          # With a published version: test the proxy. Otherwise: test this checkout.
+          EASYSQL_VERIFY_VERSION: ${{ github.event.inputs.version }}
+          EASYSQL_VERIFY_REPLACE: ${{ github.event.inputs.version == '' && github.workspace || '' }}
+        run: bash scripts/verify-goget.sh

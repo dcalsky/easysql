@@ -23,9 +23,11 @@ operations are accepted; anything else is rejected fail-closed.
 
 ## Native library setup
 
-The Go SDK calls a `polyglot-sql-ffi` shared library via PureGo (no cgo). The
-per-platform prebuilt artifacts (matching SDK version `v0.5.10`) are vendored in
-the repository's [`.ffi/`](.ffi) directory, one per platform:
+The Go SDK calls a `polyglot-sql-ffi` shared library via PureGo (no cgo). You do
+**not** need to download, build or install anything: the per-platform prebuilt
+libraries (matching SDK version `v0.5.10`) ship *inside the module*, so `go get`
+pulls in the one for your platform automatically. They live in the
+[`.ffi/`](.ffi) directory, one per platform:
 
 ```
 .ffi/polyglot-sql-ffi-macos-aarch64/libpolyglot_sql_ffi.dylib
@@ -67,6 +69,16 @@ version-checks the engine, is idempotent, and is safe for concurrent use.
 
 
 ## Usage
+
+Install:
+
+```bash
+go get github.com/dcalsky/easysql@latest
+```
+
+That is the only setup step. The native engine ships with the module, so `go get`
+pulls the matching library for your platform and it loads automatically on first
+use — there is nothing else to download or install.
 
 ```go
 // No setup: the bundled engine loads on first use.
@@ -219,6 +231,19 @@ Tests load the bundled engine the same way the API does (lazily on first use),
 so the matching `.ffi/` artifact for the host platform is loaded automatically.
 If no library can be resolved the
 tests **skip** (they do not fail), so CI without the artifact stays green.
+
+To verify the consumer experience end to end — that a project can build and run
+with nothing but `go get` (the native library ships with the module and loads on
+first use) — run the smoke test, which spins up a throwaway module against the
+published version and executes a rewrite:
+
+```bash
+scripts/verify-goget.sh                            # latest published version
+EASYSQL_VERIFY_VERSION=v0.1.0 scripts/verify-goget.sh
+```
+
+The same check runs on Linux, macOS and Windows in CI
+([`.github/workflows/goget-verify.yml`](.github/workflows/goget-verify.yml)).
 
 Tests are assertion-based, not "did not panic":
 
