@@ -13,6 +13,13 @@ import (
 
 var testClient *polyglot.Client
 
+// testWhere is a verbatim WHERE expression whose single string literal
+// (testMarker) is counted to assert how many tables were wrapped.
+const (
+	testWhere  = "tenant = 'alice'"
+	testMarker = "alice"
+)
+
 func TestMain(m *testing.M) {
 	c, err := OpenBundledClient()
 	if err != nil {
@@ -26,21 +33,13 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func mustNew(t *testing.T, predicate string, opts ...Option) *Rewriter {
-	t.Helper()
-	r, err := New(testClient, predicate, opts...)
-	if err != nil {
-		t.Fatalf("New(%q): %v", predicate, err)
-	}
-	return r
-}
-
 // --- structural validators -------------------------------------------------
 
-// countUserLiterals counts string literals equal to user in sql's AST. Each
-// wrap injects the predicate once, binding "?" to user, so this equals the
-// number of tables actually wrapped.
-func countUserLiterals(t *testing.T, sql, pg, user string) int {
+// countLiterals counts string literals equal to value in sql's AST. Each wrap
+// splices the WHERE expression once, so when that expression contains exactly
+// one occurrence of value as a string literal this equals the number of wrapped
+// tables.
+func countLiterals(t *testing.T, sql, pg, value string) int {
 	t.Helper()
 	raw, err := testClient.ParseOne(sql, pg)
 	if err != nil {
@@ -53,7 +52,7 @@ func countUserLiterals(t *testing.T, sql, pg, user string) int {
 	n := 0
 	walkJSON(node, func(m map[string]any) {
 		if lit, ok := m["literal"].(map[string]any); ok {
-			if lit["literal_type"] == "string" && lit["value"] == user {
+			if lit["literal_type"] == "string" && lit["value"] == value {
 				n++
 			}
 		}
@@ -99,21 +98,23 @@ func walkJSON(node any, fn func(map[string]any)) {
 }
 
 // rewriteValid runs a rewrite and asserts: it succeeds, the output is valid SQL
-// (re-parses), has no empty alias, and wraps exactly wantWraps tables. Returns
-// the rewritten SQL for further assertions.
-func rewriteValid(t *testing.T, r *Rewriter, sql, user string, wantWraps int) string {
+// (re-parses), has no empty alias, and wraps exactly wantWraps tables (counted
+// via marker). Returns the rewritten SQL for further assertions.
+func rewriteValid(t *testing.T, dialect, sql, whereClause, marker string, wantWraps int, opts ...Option) string {
 	t.Helper()
-	out, err := r.Rewrite(sql, user)
+	all := append([]Option{WithDialect(dialect)}, opts...)
+	out, err := ApplyRowFilter(testClient, sql, whereClause, all...)
 	if err != nil {
-		t.Fatalf("Rewrite(%q): %v", sql, err)
+		t.Fatalf("ApplyRowFilter(%q): %v", sql, err)
 	}
-	if _, err := testClient.ParseOne(out, r.pg); err != nil {
+	pg := dialectToPolyglot[dialect]
+	if _, err := testClient.ParseOne(out, pg); err != nil {
 		t.Fatalf("output is not valid SQL:\n in:  %s\n out: %s\n err: %v", sql, out, err)
 	}
-	if hasEmptyAlias(t, out, r.pg) {
+	if hasEmptyAlias(t, out, pg) {
 		t.Fatalf("output has an empty derived-table alias:\n in:  %s\n out: %s", sql, out)
 	}
-	if got := countUserLiterals(t, out, r.pg, user); got != wantWraps {
+	if got := countLiterals(t, out, pg, marker); got != wantWraps {
 		t.Fatalf("wrapped %d tables, want %d:\n in:  %s\n out: %s", got, wantWraps, sql, out)
 	}
 	return out
@@ -124,41 +125,39 @@ func rewriteValid(t *testing.T, r *Rewriter, sql, user string, wantWraps int) st
 func TestRewriteStructural(t *testing.T) {
 	cases := []struct {
 		name      string
-		predicate string
+		where     string
 		opts      []Option
 		sql       string
-		user      string
 		wantWraps int
 	}{
-		{"basic", "user = ?", nil, "select * from a", "alice", 1},
-		{"explicit alias", "user = ?", nil, "select * from a t", "alice", 1},
-		{"projection cols", "user = ?", nil, "select id, name from a", "alice", 1},
-		{"join wraps both", "user = ?", nil, "select a.id from a join b on a.id = b.id", "alice", 2},
-		{"left join not degraded", "user = ?", nil, "select * from a left join b on a.id = b.id", "alice", 2},
-		{"self join", "user = ?", nil, "select t1.id from a t1 join a t2 on t1.id = t2.id", "alice", 2},
-		{"three way", "user = ?", nil, "select * from a join b join c", "alice", 3},
-		{"subquery in where", "user = ?", []Option{WithTableNames("a")},
-			"select * from c where id in (select id from a)", "alice", 1},
-		{"derived table", "user = ?", nil, "select * from (select * from a) x", "alice", 1},
-		{"union both branches", "user = ?", nil, "select * from a union select * from b", "alice", 2},
-		{"named scope only listed", "user = ?", []Option{WithTableNames("a")},
-			"select * from a join c on a.id = c.id", "alice", 1},
-		{"out of scope untouched", "user = ?", []Option{WithTableNames("a", "b")},
-			"select * from c", "alice", 0},
-		{"regex prefix", "user = ?", []Option{WithTableRegexp("^log_")},
-			"select * from log_events join users on log_events.uid = users.id", "alice", 1},
-		{"names+regex compose", "user = ?", []Option{WithTableNames("b"), WithTableRegexp("^a$")},
-			"select * from a join b join c", "alice", 2},
-		{"disjunction predicate", "user = ? or is_public = 1", nil, "select * from a", "alice", 1},
-		{"default db resolves", "user = ?", []Option{WithTableNames("db.a"), WithDefaultDB("db")},
-			"select * from a", "alice", 1},
-		{"index hint into subquery", "user = ?", nil, "select * from a use index(idx)", "alice", 1},
-		{"partition into subquery", "user = ?", nil, "select * from a partition(p0)", "alice", 1},
+		{"basic", testWhere, nil, "select * from a", 1},
+		{"explicit alias", testWhere, nil, "select * from a t", 1},
+		{"projection cols", testWhere, nil, "select id, name from a", 1},
+		{"join wraps both", testWhere, nil, "select a.id from a join b on a.id = b.id", 2},
+		{"left join not degraded", testWhere, nil, "select * from a left join b on a.id = b.id", 2},
+		{"self join", testWhere, nil, "select t1.id from a t1 join a t2 on t1.id = t2.id", 2},
+		{"three way", testWhere, nil, "select * from a join b join c", 3},
+		{"subquery in where", testWhere, []Option{WithTableNames("a")},
+			"select * from c where id in (select id from a)", 1},
+		{"derived table", testWhere, nil, "select * from (select * from a) x", 1},
+		{"union both branches", testWhere, nil, "select * from a union select * from b", 2},
+		{"named scope only listed", testWhere, []Option{WithTableNames("a")},
+			"select * from a join c on a.id = c.id", 1},
+		{"out of scope untouched", testWhere, []Option{WithTableNames("a", "b")},
+			"select * from c", 0},
+		{"regex prefix", testWhere, []Option{WithTableRegexp("^log_")},
+			"select * from log_events join users on log_events.uid = users.id", 1},
+		{"names+regex compose", testWhere, []Option{WithTableNames("b"), WithTableRegexp("^a$")},
+			"select * from a join b join c", 2},
+		{"disjunction where", "tenant = 'alice' or is_public = 1", nil, "select * from a", 1},
+		{"default db resolves", testWhere, []Option{WithTableNames("db.a"), WithDefaultDB("db")},
+			"select * from a", 1},
+		{"index hint into subquery", testWhere, nil, "select * from a use index(idx)", 1},
+		{"partition into subquery", testWhere, nil, "select * from a partition(p0)", 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := mustNew(t, tc.predicate, tc.opts...)
-			rewriteValid(t, r, tc.sql, tc.user, tc.wantWraps)
+			rewriteValid(t, "mysql", tc.sql, tc.where, testMarker, tc.wantWraps, tc.opts...)
 		})
 	}
 }
@@ -168,7 +167,6 @@ func TestRewriteStructural(t *testing.T) {
 // where a global CTE-name set would either over-wrap or, worse, leave a real
 // table unfiltered.
 func TestCTEReferencesNotWrapped(t *testing.T) {
-	r := mustNew(t, "user = ?")
 	cases := []struct {
 		sql       string
 		wantWraps int
@@ -183,7 +181,7 @@ func TestCTEReferencesNotWrapped(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.sql, func(t *testing.T) {
-			rewriteValid(t, r, tc.sql, "alice", tc.wantWraps)
+			rewriteValid(t, "mysql", tc.sql, testWhere, testMarker, tc.wantWraps)
 		})
 	}
 }
@@ -192,9 +190,8 @@ func TestCTEReferencesNotWrapped(t *testing.T) {
 // one set-operation branch must not cause the real table t in the sibling
 // branch to be left unfiltered. The real t MUST be wrapped.
 func TestCTEScopeSecurity(t *testing.T) {
-	r := mustNew(t, "user = ?")
 	sql := "select * from t union all select * from (with t as (select 1 as id) select * from t) q"
-	out := rewriteValid(t, r, sql, "alice", 1) // exactly the real t in branch 1
+	out := rewriteValid(t, "mysql", sql, testWhere, testMarker, 1) // exactly the real t in branch 1
 	// Be explicit: the first branch's real table must be filtered.
 	if !strings.Contains(out, "FROM (SELECT * FROM t WHERE") && !strings.Contains(out, "FROM (SELECT * FROM `t` WHERE") {
 		t.Fatalf("real table t was not filtered (security regression):\n%s", out)
@@ -213,20 +210,17 @@ func TestTableFunctionsNotWrapped(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.sql, func(t *testing.T) {
-			r := mustNew(t, "user = ?", WithDialect(tc.dialect))
-			rewriteValid(t, r, tc.sql, "alice", 0)
+			rewriteValid(t, tc.dialect, tc.sql, testWhere, testMarker, 0)
 		})
 	}
 	// A real table joined with a table function: only the real table is wrapped.
-	r := mustNew(t, "user = ?", WithDialect("trino"))
-	rewriteValid(t, r, "select x from a cross join unnest(a.arr) as t(x)", "alice", 1)
+	rewriteValid(t, "trino", "select x from a cross join unnest(a.arr) as t(x)", testWhere, testMarker, 1)
 }
 
 // TestQuotingPreserved: a quoted reserved-word identifier must stay quoted, or
 // the output would be invalid SQL.
 func TestQuotingPreserved(t *testing.T) {
-	r := mustNew(t, "user = ?", WithDialect("postgres"))
-	out := rewriteValid(t, r, `select * from "order"`, "alice", 1)
+	out := rewriteValid(t, "postgres", `select * from "order"`, testWhere, testMarker, 1)
 	if !strings.Contains(out, `"order"`) {
 		t.Fatalf("quoting on reserved-word identifier was lost: %s", out)
 	}
@@ -234,25 +228,20 @@ func TestQuotingPreserved(t *testing.T) {
 
 // TestDualSkipped: the DUAL pseudo-table is never wrapped.
 func TestDualSkipped(t *testing.T) {
-	r := mustNew(t, "user = ?")
-	rewriteValid(t, r, "select 1 from dual", "alice", 0)
+	rewriteValid(t, "mysql", "select 1 from dual", testWhere, testMarker, 0)
 }
 
-// TestUserLiteralEscaped: a malicious current_user must be injected as a single
-// escaped literal, not break out of the string (no SQL injection).
-func TestUserLiteralEscaped(t *testing.T) {
-	r := mustNew(t, "user = ?")
-	const evil = "x' OR '1'='1"
-	// If escaping were wrong the output would not re-parse, or would contain
-	// more than one user literal. wantWraps==1 asserts exactly one binding.
-	out := rewriteValid(t, r, "select * from a", evil, 1)
-	if strings.Count(out, "OR") > 0 && !strings.Contains(out, "''") {
-		t.Fatalf("user value does not appear escaped: %s", out)
+// TestWhereSplicedVerbatim: the WHERE expression is spliced as-is, so a literal
+// the caller already bound appears verbatim in each wrapped table.
+func TestWhereSplicedVerbatim(t *testing.T) {
+	out := rewriteValid(t, "mysql", "select * from a join b on a.id = b.id",
+		"tenant = 'acme'", "acme", 2)
+	if strings.Count(out, "'acme'") != 2 {
+		t.Fatalf("where expression not spliced verbatim into each table: %s", out)
 	}
 }
 
 func TestErrors(t *testing.T) {
-	r := mustNew(t, "user = ?")
 	cases := []struct {
 		name string
 		sql  string
@@ -266,9 +255,9 @@ func TestErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := r.Rewrite(tc.sql, "alice")
+			_, err := ApplyRowFilter(testClient, tc.sql, testWhere)
 			if !errors.Is(err, tc.want) {
-				t.Fatalf("Rewrite(%q) error = %v, want %v", tc.sql, err, tc.want)
+				t.Fatalf("ApplyRowFilter(%q) error = %v, want %v", tc.sql, err, tc.want)
 			}
 		})
 	}
@@ -276,20 +265,20 @@ func TestErrors(t *testing.T) {
 
 func TestConfigValidation(t *testing.T) {
 	cases := []struct {
-		name      string
-		predicate string
-		opts      []Option
+		name  string
+		where string
+		opts  []Option
 	}{
-		{"empty predicate", "", nil},
-		{"invalid predicate", "user ===", nil},
-		{"unknown dialect", "user = ?", []Option{WithDialect("oracle")}},
-		{"empty regexp", "user = ?", []Option{WithTableRegexp("")}},
-		{"invalid regexp", "user = ?", []Option{WithTableRegexp("(")}},
+		{"empty where", "", nil},
+		{"invalid where", "user ===", nil},
+		{"unknown dialect", testWhere, []Option{WithDialect("oracle")}},
+		{"empty regexp", testWhere, []Option{WithTableRegexp("")}},
+		{"invalid regexp", testWhere, []Option{WithTableRegexp("(")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := New(testClient, tc.predicate, tc.opts...); err == nil {
-				t.Fatalf("New(%q) succeeded, want error", tc.predicate)
+			if _, err := ApplyRowFilter(testClient, "select * from a", tc.where, tc.opts...); err == nil {
+				t.Fatalf("ApplyRowFilter(where=%q) succeeded, want error", tc.where)
 			}
 		})
 	}
@@ -297,14 +286,13 @@ func TestConfigValidation(t *testing.T) {
 
 func TestSelfCheck(t *testing.T) {
 	// With self-check on, a valid rewrite still succeeds.
-	r := mustNew(t, "user = ?", WithSelfCheck(true))
 	for _, sql := range []string{
 		"select * from a",
 		"select a.id from a join b on a.id = b.id",
 		"select * from a union select * from b",
 		"with c as (select * from a) select * from c",
 	} {
-		if _, err := r.Rewrite(sql, "alice"); err != nil {
+		if _, err := ApplyRowFilter(testClient, sql, testWhere, WithSelfCheck(true)); err != nil {
 			t.Fatalf("self-check rewrite %q: %v", sql, err)
 		}
 	}
@@ -368,15 +356,10 @@ func TestDialectBoundary(t *testing.T) {
 		{"mysql", "union all", "select * from a union all select * from b", 2},
 	}
 
-	rewriters := map[string]*Rewriter{}
-	for _, d := range []string{"postgres", "trino", "starrocks", "mysql"} {
-		rewriters[d] = mustNew(t, "user = ?", WithDialect(d))
-	}
-
 	pass := 0
 	for _, tc := range cases {
 		t.Run(tc.dialect+"/"+tc.name, func(t *testing.T) {
-			rewriteValid(t, rewriters[tc.dialect], tc.sql, "alice", tc.wantWraps)
+			rewriteValid(t, tc.dialect, tc.sql, testWhere, testMarker, tc.wantWraps)
 		})
 		pass++
 	}
