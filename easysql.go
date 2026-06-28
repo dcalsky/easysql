@@ -15,11 +15,11 @@
 // Only SELECT and set operations (UNION / INTERSECT / EXCEPT) are supported;
 // anything else is rejected (fail-closed).
 //
-// The transform is performed directly on Polyglot's JSON AST. The wrapper
-// subquery and the predicate are parsed once when the Rewriter is constructed
-// and then deep-cloned per table, so a rewrite costs one Parse and one Generate
-// FFI call regardless of how many tables it touches, and the original
-// identifier quoting is preserved by splicing the original table node verbatim.
+// The transform is performed directly on Polyglot's JSON AST. Each
+// ApplyRowFilter call parses the WHERE expression and a wrapper skeleton once,
+// then deep-clones them per table, so the number of FFI calls does not grow with
+// the table count, and the original identifier quoting is preserved by splicing
+// the original table node verbatim.
 package easysql
 
 import (
@@ -53,10 +53,9 @@ var dialectToPolyglot = map[string]string{
 	"trino":     "trino",
 }
 
-// Rewriter applies a single row-level predicate to SELECT statements. A
-// Rewriter is read-only after construction and safe for concurrent use, as
-// long as the underlying *polyglot.Client is.
-type Rewriter struct {
+// rewriter applies a single row-level WHERE expression to SELECT statements. It
+// is built per ApplyRowFilter call and is not part of the public API.
+type rewriter struct {
 	client  *polyglot.Client
 	dialect string // our dialect name
 	pg      string // polyglot dialect identifier
@@ -64,7 +63,7 @@ type Rewriter struct {
 	selfCheck bool
 
 	// Table scope. scopeSet becomes true once any scope option is supplied;
-	// while it is false the predicate applies to every table.
+	// while it is false the WHERE expression applies to every table.
 	scopeSet  bool
 	byKey     map[string]bool // "schema\x00table"
 	byName    map[string]bool // bare table names
@@ -72,13 +71,13 @@ type Rewriter struct {
 	defaultDB string
 
 	// Parsed-once templates (immutable; always deep-cloned before mutation).
-	predTemplate any            // boolean expression JSON (where_clause.this)
-	skeleton     map[string]any // {"subquery": {...}} wrapper JSON
+	whereExpr any            // boolean expression JSON (where_clause.this)
+	skeleton  map[string]any // {"subquery": {...}} wrapper JSON
 
 	normalize func(string) string // optional dialect text normalizer
 }
 
-// Option configures a Rewriter.
+// Option configures an ApplyRowFilter call.
 type Option func(*options)
 
 type options struct {
@@ -93,15 +92,15 @@ type options struct {
 // a schema-qualified scope (typically the session's current database).
 func WithDefaultDB(db string) Option { return func(o *options) { o.defaultDB = db } }
 
-// WithTableNames restricts the predicate to the given tables. Names may be bare
-// ("orders") or schema-qualified ("sales.orders").
+// WithTableNames restricts the WHERE expression to the given tables. Names may
+// be bare ("orders") or schema-qualified ("sales.orders").
 func WithTableNames(names ...string) Option {
 	return func(o *options) { o.tableNames = append(o.tableNames, names...) }
 }
 
-// WithTableRegexp restricts the predicate to tables whose name (as written)
-// matches any of the given Go regular expressions. Composes additively with
-// WithTableNames.
+// WithTableRegexp restricts the WHERE expression to tables whose name (as
+// written) matches any of the given Go regular expressions. Composes additively
+// with WithTableNames.
 func WithTableRegexp(patterns ...string) Option {
 	return func(o *options) { o.tableRegexp = append(o.tableRegexp, patterns...) }
 }
@@ -113,15 +112,32 @@ func WithDialect(d string) Option { return func(o *options) { o.dialect = d } }
 // it is invalid. Off by default for speed; enable it in CI/canary.
 func WithSelfCheck(b bool) Option { return func(o *options) { o.selfCheck = b } }
 
-// New creates a Rewriter that applies predicate using client. The caller owns
-// client's lifecycle. predicate is a boolean SQL expression; each "?" is bound
-// to the current user at rewrite time as an escaped string literal.
-func New(client *polyglot.Client, predicate string, opts ...Option) (*Rewriter, error) {
+// ApplyRowFilter rewrites sql (a single SELECT/UNION) so that every reference to
+// an in-scope physical table is wrapped in a derived table pre-filtered by
+// whereClause:
+//
+//	SELECT * FROM a  ->  SELECT * FROM (SELECT * FROM a WHERE <whereClause>) AS a
+//
+// whereClause is a boolean SQL expression spliced verbatim as an AST node, so
+// the caller is responsible for any value binding or escaping inside it. The
+// caller owns client's lifecycle. Errors classify via errors.Is against
+// ErrParse, ErrUnsupported and ErrInternal; configuration mistakes (empty
+// whereClause, unknown dialect, bad table regexp, …) return a plain error.
+func ApplyRowFilter(client *polyglot.Client, sql, whereClause string, opts ...Option) (string, error) {
+	r, err := compile(client, whereClause, opts...)
+	if err != nil {
+		return "", err
+	}
+	return r.rewrite(sql)
+}
+
+// compile validates whereClause and the options and builds a reusable rewriter.
+func compile(client *polyglot.Client, whereClause string, opts ...Option) (*rewriter, error) {
 	if client == nil {
 		return nil, errors.New("easysql: nil polyglot client")
 	}
-	if strings.TrimSpace(predicate) == "" {
-		return nil, errors.New("easysql: predicate must not be empty")
+	if strings.TrimSpace(whereClause) == "" {
+		return nil, errors.New("easysql: where clause must not be empty")
 	}
 
 	cfg := options{dialect: "mysql"}
@@ -134,7 +150,7 @@ func New(client *polyglot.Client, predicate string, opts ...Option) (*Rewriter, 
 		return nil, fmt.Errorf("easysql: unknown dialect %q", cfg.dialect)
 	}
 
-	r := &Rewriter{
+	r := &rewriter{
 		client:    client,
 		dialect:   cfg.dialect,
 		pg:        pg,
@@ -180,14 +196,14 @@ func New(client *polyglot.Client, predicate string, opts ...Option) (*Rewriter, 
 	if err := r.compileSkeleton(); err != nil {
 		return nil, err
 	}
-	if err := r.compilePredicate(predicate); err != nil {
+	if err := r.compileWhere(whereClause); err != nil {
 		return nil, err
 	}
 	return r, nil
 }
 
 // compileSkeleton parses the wrapper subquery once so it can be cloned per table.
-func (r *Rewriter) compileSkeleton() error {
+func (r *rewriter) compileSkeleton() error {
 	const skeletonSQL = "SELECT * FROM (SELECT * FROM zzz_tbl WHERE 1 = 1) AS zzz_alias"
 	raw, err := r.client.ParseOne(skeletonSQL, r.pg)
 	if err != nil {
@@ -210,11 +226,11 @@ func (r *Rewriter) compileSkeleton() error {
 	return nil
 }
 
-// compilePredicate validates the predicate and caches its boolean expression.
-func (r *Rewriter) compilePredicate(predicate string) error {
-	raw, err := r.client.ParseOne("SELECT 1 WHERE "+predicate, r.pg)
+// compileWhere validates whereClause and caches its boolean expression.
+func (r *rewriter) compileWhere(whereClause string) error {
+	raw, err := r.client.ParseOne("SELECT 1 WHERE "+whereClause, r.pg)
 	if err != nil {
-		return fmt.Errorf("easysql: invalid predicate %q: %w", predicate, err)
+		return fmt.Errorf("easysql: invalid where clause %q: %w", whereClause, err)
 	}
 	var node map[string]any
 	if err := sonic.Unmarshal(raw, &node); err != nil {
@@ -222,15 +238,15 @@ func (r *Rewriter) compilePredicate(predicate string) error {
 	}
 	this, ok := dig(node, "select", "where_clause", "this")
 	if !ok || this == nil {
-		return fmt.Errorf("easysql: invalid predicate %q: not a boolean expression", predicate)
+		return fmt.Errorf("easysql: invalid where clause %q: not a boolean expression", whereClause)
 	}
-	r.predTemplate = this
+	r.whereExpr = this
 	return nil
 }
 
-// Rewrite rewrites sql (a single SELECT/UNION) applying the predicate, binding
-// currentUser to every "?" placeholder.
-func (r *Rewriter) Rewrite(sql, currentUser string) (string, error) {
+// rewrite rewrites sql (a single SELECT/UNION), wrapping every in-scope physical
+// table in a derived table pre-filtered by the compiled WHERE expression.
+func (r *rewriter) rewrite(sql string) (string, error) {
 	if r.normalize != nil {
 		sql = r.normalize(sql)
 	}
@@ -251,7 +267,7 @@ func (r *Rewriter) Rewrite(sql, currentUser string) (string, error) {
 		return "", fmt.Errorf("%w: only SELECT statements are supported", ErrUnsupported)
 	}
 
-	rc := &rewriteCtx{r: r, currentUser: currentUser, strip: map[string]bool{}}
+	rc := &rewriteCtx{r: r, strip: map[string]bool{}}
 	rc.walk(stmts[0], nil)
 	rc.applyStrip(stmts[0])
 
@@ -272,7 +288,7 @@ func (r *Rewriter) Rewrite(sql, currentUser string) (string, error) {
 
 // matches reports whether the table wrapper v is an in-scope physical table to
 // filter. CTE references are handled by the scope-aware walk, not here.
-func (r *Rewriter) matches(v map[string]any) bool {
+func (r *rewriter) matches(v map[string]any) bool {
 	t, _ := v["table"].(map[string]any)
 	name := identName(t["name"])
 	if name == "" {
@@ -310,9 +326,8 @@ func (r *Rewriter) matches(v map[string]any) bool {
 // ---------------------------------------------------------------------------
 
 type rewriteCtx struct {
-	r           *Rewriter
-	currentUser string
-	strip       map[string]bool // "schema\x00table" pairs whose column refs lose the schema
+	r     *rewriter
+	strip map[string]bool // "schema\x00table" pairs whose column refs lose the schema
 }
 
 // walk traverses the JSON AST. scope is a stack of CTE-name sets in effect at
@@ -403,9 +418,8 @@ func (rc *rewriteCtx) wrap(v map[string]any) {
 	innerSel := sq["this"].(map[string]any)["select"].(map[string]any)
 	innerSel["from"].(map[string]any)["expressions"] = []any{inner}
 
-	pred := deepClone(rc.r.predTemplate)
-	bindPlaceholders(pred, rc.currentUser)
-	innerSel["where_clause"] = map[string]any{"this": pred}
+	where := deepClone(rc.r.whereExpr)
+	innerSel["where_clause"] = map[string]any{"this": where}
 
 	for k := range v {
 		delete(v, k)
@@ -457,25 +471,6 @@ func stripDots(node any, strip map[string]bool) {
 	case []any:
 		for _, child := range v {
 			stripDots(child, strip)
-		}
-	}
-}
-
-// bindPlaceholders replaces every placeholder node with a string literal of user.
-func bindPlaceholders(node any, user string) {
-	switch v := node.(type) {
-	case map[string]any:
-		if _, ok := v["placeholder"]; ok {
-			delete(v, "placeholder")
-			v["literal"] = map[string]any{"literal_type": "string", "value": user}
-			return
-		}
-		for _, child := range v {
-			bindPlaceholders(child, user)
-		}
-	case []any:
-		for _, child := range v {
-			bindPlaceholders(child, user)
 		}
 	}
 }

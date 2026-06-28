@@ -12,7 +12,7 @@ filtered derived table.
 ```sql
 -- input
 SELECT * FROM a
--- output (predicate "user = ?", current user "alice")
+-- output (where clause "user = 'alice'")
 SELECT * FROM (SELECT * FROM a WHERE user = 'alice') AS a
 ```
 
@@ -69,12 +69,14 @@ client, err := easysql.OpenBundledClient() // detects OS/arch, loads from .ffi/
 if err != nil { log.Fatal(err) }
 defer client.Close()
 
-r, err := easysql.New(client, "user = ?", easysql.WithDialect("postgres"))
+out, err := easysql.ApplyRowFilter(client, `select "uid" from a`, "user = 'alice'", easysql.WithDialect("postgres"))
 if err != nil { log.Fatal(err) }
-
-out, err := r.Rewrite(`select "uid" from a`, "alice")
 // SELECT "uid" FROM (SELECT * FROM "a" WHERE user = 'alice') AS "a"
 ```
+
+`ApplyRowFilter` is a one-shot, stateless call — there is no constructor to keep around,
+mirroring `SourceTableColumns` below. It is safe for concurrent use as long as
+the underlying `*polyglot.Client` is.
 
 
 
@@ -84,16 +86,18 @@ out, err := r.Rewrite(`select "uid" from a`, "alice")
 | Option                     | Description                                                                     |
 | -------------------------- | ------------------------------------------------------------------------------- |
 | `WithDialect(d)`           | `mysql` (default), `starrocks`, `postgres`, `trino`.                            |
-| `WithTableNames(names...)` | Restrict the predicate to these tables (bare or `schema.table`).                |
+| `WithTableNames(names...)` | Restrict the WHERE clause to these tables (bare or `schema.table`).             |
 | `WithTableRegexp(pats...)` | Restrict to tables matching any Go regexp. Composes with `WithTableNames`.      |
 | `WithDefaultDB(db)`        | Schema used to resolve unqualified names against a qualified scope.             |
 | `WithSelfCheck(b)`         | Re-parse the output and fail closed (`ErrInternal`) if invalid. Off by default. |
 
 
-Each `?` in the predicate is bound to `current_user` as an **escaped string
-literal** (no SQL injection). Errors classify via `errors.Is` against
-`ErrParse`, `ErrUnsupported`, `ErrInternal`; config mistakes return a plain
-error from `New`.
+The `whereClause` is a boolean SQL expression spliced **verbatim** as an AST
+node (not string-concatenated into the query), so binding and escaping any
+values inside it is the caller's responsibility. Errors classify via `errors.Is`
+against `ErrParse`, `ErrUnsupported`, `ErrInternal`; configuration mistakes
+(empty `whereClause`, unknown dialect, bad table regexp, …) return a plain
+error.
 
 ## Column-level lineage
 
@@ -175,9 +179,10 @@ overhead on the common case.
 
 ## Design notes
 
-The transform runs directly on Polyglot's JSON AST. The wrapper subquery and the
-predicate are parsed **once in** `New`, then deep-cloned and spliced per table,
-so a rewrite is one `Parse` + one `Generate` FFI call regardless of table count.
+The transform runs directly on Polyglot's JSON AST. Each `ApplyRowFilter` call parses
+the WHERE expression and a wrapper skeleton **once**, then deep-clones and
+splices them per table, so the number of FFI calls does not grow with the table
+count.
 
 This implementation deliberately avoids several shortcuts a naive version would
 take:
@@ -195,8 +200,10 @@ cause a real table `t` in a sibling branch to be left unfiltered — a security
 bug a global CTE-name set would introduce. (`TestCTEScopeSecurity` is the
 regression, and it has been verified to fail if the scoping is weakened.) CTE
 *references* are never wrapped, only the real tables in or around them.
-- **No injection.** `current_user` is injected as a literal AST node, not string
-interpolation.
+- **Verbatim splice.** The WHERE expression is parsed and spliced as an AST
+node, not concatenated into the query text, so the surrounding statement is
+never disturbed. Binding/escaping of any values inside it is the caller's
+responsibility.
 
 
 
