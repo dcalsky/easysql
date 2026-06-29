@@ -5,7 +5,7 @@
 // Given a boolean predicate, every reference to an in-scope physical table is
 // turned into a filtered derived table:
 //
-//	SELECT * FROM a  ->  SELECT * FROM (SELECT * FROM a WHERE <predicate>) AS a
+//	select * from a  ->  SELECT * FROM (SELECT * FROM a WHERE <predicate>) AS a
 //
 // Wrapping each table in its own pre-filtered subquery (instead of appending a
 // single top-level WHERE) keeps the rewrite correct across JOIN / LEFT JOIN
@@ -15,11 +15,12 @@
 // Only SELECT and set operations (UNION / INTERSECT / EXCEPT) are supported;
 // anything else is rejected (fail-closed).
 //
-// The transform is performed directly on Polyglot's JSON AST. Each
-// ApplyRowFilter call parses the WHERE expression and a wrapper skeleton once,
-// then deep-clones them per table, so the number of FFI calls does not grow with
-// the table count, and the original identifier quoting is preserved by splicing
-// the original table node verbatim.
+// The rewrite operates on the parsed AST: each in-scope physical-table node is
+// replaced by a filtered-subquery node, and the statement is rendered back to
+// SQL by the engine's generator. The output is therefore normalized
+// (re-formatted by the generator) rather than byte-identical to the input. The
+// rewritten SQL is always re-parsed before being returned, so the call either
+// yields valid SQL or fails closed (ErrInternal).
 package easysql
 
 import (
@@ -27,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/bytedance/sonic"
@@ -60,8 +62,6 @@ type rewriter struct {
 	dialect string // our dialect name
 	pg      string // polyglot dialect identifier
 
-	selfCheck bool
-
 	// Table scope. scopeSet becomes true once any scope option is supplied;
 	// while it is false the WHERE expression applies to every table.
 	scopeSet  bool
@@ -70,11 +70,16 @@ type rewriter struct {
 	regexps   []*regexp.Regexp
 	defaultDB string
 
-	// Parsed-once templates (immutable; always deep-cloned before mutation).
-	whereExpr any            // boolean expression JSON (where_clause.this)
-	skeleton  map[string]any // {"subquery": {...}} wrapper JSON
+	// whereText is the caller's predicate, baked verbatim into the subquery
+	// template's WHERE clause.
+	whereText string
 
 	normalize func(string) string // optional dialect text normalizer
+
+	// tmplSubquery is the AST subquery template used by the rewrite. It is built
+	// lazily, once per rewriter, with the predicate already baked into its
+	// WHERE clause.
+	tmplSubquery map[string]any
 }
 
 // Option configures an ApplyRowFilter call.
@@ -85,7 +90,6 @@ type options struct {
 	tableNames  []string
 	tableRegexp []string
 	dialect     string
-	selfCheck   bool
 }
 
 // WithDefaultDB sets the schema used to resolve unqualified table names against
@@ -108,18 +112,23 @@ func WithTableRegexp(patterns ...string) Option {
 // WithDialect selects the SQL dialect: one of mysql, starrocks, postgres, trino.
 func WithDialect(d string) Option { return func(o *options) { o.dialect = d } }
 
-// WithSelfCheck re-parses the rewritten SQL and fails closed (ErrInternal) if
-// it is invalid. Off by default for speed; enable it in CI/canary.
-func WithSelfCheck(b bool) Option { return func(o *options) { o.selfCheck = b } }
+// WithSelfCheck is retained for backward compatibility and is now a no-op: the
+// rewritten SQL is always re-parsed and the call fails closed (ErrInternal) if
+// it is not valid, so self-checking can no longer be disabled.
+//
+// Deprecated: validity is always checked; this option has no effect.
+func WithSelfCheck(bool) Option { return func(*options) {} }
 
 // ApplyRowFilter rewrites sql (a single SELECT/UNION) so that every reference to
 // an in-scope physical table is wrapped in a derived table pre-filtered by
 // whereClause:
 //
-//	SELECT * FROM a  ->  SELECT * FROM (SELECT * FROM a WHERE <whereClause>) AS a
+//	select * from a  ->  SELECT * FROM (SELECT * FROM a WHERE <whereClause>) AS a
 //
-// whereClause is a boolean SQL expression spliced verbatim as an AST node, so
-// the caller is responsible for any value binding or escaping inside it.
+// whereClause is a boolean SQL expression spliced verbatim, so the caller is
+// responsible for any value binding or escaping inside it. The statement is
+// rebuilt from its AST, so the output is normalized (re-formatted) rather than
+// byte-identical to the input.
 //
 // The native SQL engine is loaded automatically on first use (see Init), so no
 // setup is required. Errors classify via errors.Is against ErrParse,
@@ -160,7 +169,6 @@ func compile(client *polyglot.Client, whereClause string, opts ...Option) (*rewr
 		client:    client,
 		dialect:   cfg.dialect,
 		pg:        pg,
-		selfCheck: cfg.selfCheck,
 		byKey:     map[string]bool{},
 		byName:    map[string]bool{},
 		defaultDB: strings.ToLower(strings.TrimSpace(cfg.defaultDB)),
@@ -199,40 +207,14 @@ func compile(client *polyglot.Client, whereClause string, opts ...Option) (*rewr
 		r.normalize = starrocksNormalizer
 	}
 
-	if err := r.compileSkeleton(); err != nil {
-		return nil, err
-	}
 	if err := r.compileWhere(whereClause); err != nil {
 		return nil, err
 	}
 	return r, nil
 }
 
-// compileSkeleton parses the wrapper subquery once so it can be cloned per table.
-func (r *rewriter) compileSkeleton() error {
-	const skeletonSQL = "SELECT * FROM (SELECT * FROM zzz_tbl WHERE 1 = 1) AS zzz_alias"
-	raw, err := r.client.ParseOne(skeletonSQL, r.pg)
-	if err != nil {
-		return fmt.Errorf("easysql: cannot build wrapper skeleton: %w", err)
-	}
-	var node map[string]any
-	if err := sonic.Unmarshal(raw, &node); err != nil {
-		return err
-	}
-	sub, ok := dig(node, "select", "from", "expressions")
-	exprs, _ := sub.([]any)
-	if !ok || len(exprs) == 0 {
-		return errors.New("easysql: unexpected skeleton shape")
-	}
-	sq, ok := exprs[0].(map[string]any)
-	if !ok || sq["subquery"] == nil {
-		return errors.New("easysql: unexpected skeleton subquery shape")
-	}
-	r.skeleton = sq
-	return nil
-}
-
-// compileWhere validates whereClause and caches its boolean expression.
+// compileWhere validates whereClause (it must be a boolean expression) and
+// stores its trimmed text for verbatim splicing.
 func (r *rewriter) compileWhere(whereClause string) error {
 	raw, err := r.client.ParseOne("SELECT 1 WHERE "+whereClause, r.pg)
 	if err != nil {
@@ -246,50 +228,261 @@ func (r *rewriter) compileWhere(whereClause string) error {
 	if !ok || this == nil {
 		return fmt.Errorf("easysql: invalid where clause %q: not a boolean expression", whereClause)
 	}
-	r.whereExpr = this
+	r.whereText = strings.TrimSpace(whereClause)
 	return nil
 }
 
-// rewrite rewrites sql (a single SELECT/UNION), wrapping every in-scope physical
-// table in a derived table pre-filtered by the compiled WHERE expression.
-func (r *rewriter) rewrite(sql string) (string, error) {
+// prepare runs the steps shared by parsing and decision-making: dialect
+// normalization, the input guard, parsing, single-supported-statement
+// validation, and the scope-aware collection of table references. It returns the
+// parsed statement list (mutated in place by the rewrite) and the per-table
+// decisions.
+func (r *rewriter) prepare(sql string) ([]any, []*tableDecision, error) {
 	if r.normalize != nil {
 		sql = r.normalize(sql)
 	}
 
+	// Reject pathologically large or deeply nested input before touching the
+	// FFI: polyglot's native recursive-descent parser can stack-overflow and
+	// crash the whole process on deep expression nesting (which Go cannot
+	// recover from). Fail closed instead.
+	if err := guardInput(sql); err != nil {
+		return nil, nil, err
+	}
+
 	raw, err := r.client.Parse(sql, r.pg)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrParse, err)
+		return nil, nil, fmt.Errorf("%w: %v", ErrParse, err)
 	}
 	var stmts []any
 	if err := sonic.Unmarshal(raw, &stmts); err != nil {
-		return "", fmt.Errorf("%w: %v", ErrInternal, err)
+		return nil, nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
 	stmts = dropNils(stmts)
 	if len(stmts) != 1 {
-		return "", fmt.Errorf("%w: expected exactly one statement, got %d", ErrUnsupported, len(stmts))
+		return nil, nil, fmt.Errorf("%w: expected exactly one statement, got %d", ErrUnsupported, len(stmts))
 	}
 	if !isSupportedRoot(stmts[0]) {
-		return "", fmt.Errorf("%w: only SELECT statements are supported", ErrUnsupported)
+		return nil, nil, fmt.Errorf("%w: only SELECT statements are supported", ErrUnsupported)
 	}
 
-	rc := &rewriteCtx{r: r, strip: map[string]bool{}}
-	rc.walk(stmts[0], nil)
-	rc.applyStrip(stmts[0])
+	var decs []*tableDecision
+	r.collect(stmts[0], nil, &decs)
+	return stmts, decs, nil
+}
 
-	out, err := r.client.Generate(mustMarshal(stmts), r.pg)
-	if err != nil || len(out) == 0 {
-		return "", fmt.Errorf("%w: generate failed: %v", ErrInternal, err)
+const tmplPlaceholder = "__easysql_ph__"
+
+// rewrite rewrites sql by transforming the AST -- replacing each in-scope
+// physical-table node with a filtered-subquery node -- and rendering the result
+// back to SQL with the engine's generator.
+func (r *rewriter) rewrite(sql string) (string, error) {
+	stmts, decs, err := r.prepare(sql)
+	if err != nil {
+		return "", err
 	}
-	res := out[0]
 
-	if r.selfCheck {
-		if _, err := r.client.ParseOne(res, r.pg); err != nil {
-			return "", fmt.Errorf("%w: rewritten SQL failed to re-parse: %v\nrewritten: %s",
-				ErrInternal, err, res)
+	strip := map[string]bool{}
+	wrapped := 0
+	var tmpl map[string]any
+	for _, d := range decs {
+		if !d.wrap {
+			continue
+		}
+		if tmpl == nil {
+			if tmpl, err = r.subqueryTemplate(); err != nil {
+				return "", err
+			}
+		}
+		r.wrapTableNode(d.node, tmpl)
+		wrapped++
+		if d.strip {
+			strip[d.stripKey] = true
 		}
 	}
+
+	// Nothing in scope: a genuine no-op. Return the input unchanged instead of
+	// round-tripping it through the generator -- that would reformat untouched
+	// SQL for no reason and, for pathological input, the generator cannot always
+	// reproduce valid SQL.
+	if wrapped == 0 {
+		return sql, nil
+	}
+
+	if len(strip) > 0 {
+		stripSchemaAST(stmts[0], strip)
+	}
+
+	gen, err := r.client.Generate(mustMarshal(stmts), r.pg)
+	if err != nil || len(gen) == 0 {
+		return "", fmt.Errorf("%w: generate failed: %v", ErrInternal, err)
+	}
+	res := gen[0]
+
+	// Mandatory validity gate: never return SQL that does not parse. This turns
+	// any transform defect into a classified ErrInternal (fail closed) instead
+	// of emitting malformed SQL.
+	if _, err := r.client.ParseOne(res, r.pg); err != nil {
+		return "", fmt.Errorf("%w: rewritten SQL failed to re-parse: %v\nrewritten: %s",
+			ErrInternal, err, res)
+	}
 	return res, nil
+}
+
+// subqueryTemplate returns (and caches) the AST node for a filtered subquery
+// with the predicate already baked into its WHERE clause:
+//
+//	(SELECT * FROM __ph__ WHERE <predicate>) AS __ph__
+//
+// Building it by parsing once (rather than hand-assembling JSON) guarantees the
+// node carries every field the engine expects. The inner FROM table and the
+// subquery alias are substituted per call in wrapTableNode.
+func (r *rewriter) subqueryTemplate() (map[string]any, error) {
+	if r.tmplSubquery != nil {
+		return r.tmplSubquery, nil
+	}
+	tmplSQL := "SELECT * FROM (SELECT * FROM " + tmplPlaceholder + " WHERE " +
+		r.whereText + ") AS " + tmplPlaceholder
+	raw, err := r.client.ParseOne(tmplSQL, r.pg)
+	if err != nil {
+		return nil, fmt.Errorf("%w: building subquery template: %v", ErrInternal, err)
+	}
+	var node map[string]any
+	if err := sonic.Unmarshal(raw, &node); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
+	}
+	exprs, ok := dig(node, "select", "from", "expressions")
+	if !ok {
+		return nil, fmt.Errorf("%w: malformed subquery template", ErrInternal)
+	}
+	list, ok := exprs.([]any)
+	if !ok || len(list) == 0 {
+		return nil, fmt.Errorf("%w: malformed subquery template", ErrInternal)
+	}
+	item, ok := list[0].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%w: malformed subquery template", ErrInternal)
+	}
+	sub, ok := item["subquery"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%w: malformed subquery template", ErrInternal)
+	}
+	r.tmplSubquery = sub
+	return sub, nil
+}
+
+// wrapTableNode converts an AST table node ({"table": ...}) in place into a
+// filtered-subquery node ({"subquery": ...}). The original table (with its alias
+// stripped) becomes the subquery's inner FROM table, and the subquery inherits
+// the table's alias (or, when there is none, its name).
+func (r *rewriter) wrapTableNode(node map[string]any, tmpl map[string]any) {
+	orig, _ := node["table"].(map[string]any)
+	if orig == nil {
+		return
+	}
+
+	// Alias for the derived table: the explicit alias when present, otherwise
+	// the table's own name identifier.
+	var aliasNode any
+	if a, ok := orig["alias"].(map[string]any); ok && a != nil {
+		aliasNode = deepCopyJSON(a)
+	} else {
+		aliasNode = deepCopyJSON(orig["name"])
+	}
+
+	// Inner table = the original, minus its alias (the alias moves outward).
+	innerTable, _ := deepCopyJSON(orig).(map[string]any)
+	innerTable["alias"] = nil
+
+	sub, _ := deepCopyJSON(tmpl).(map[string]any)
+	sub["alias"] = aliasNode
+	if sel, ok := dig(sub, "this", "select"); ok {
+		if selMap, ok := sel.(map[string]any); ok {
+			if from, ok := selMap["from"].(map[string]any); ok {
+				if exprs, ok := from["expressions"].([]any); ok && len(exprs) > 0 {
+					exprs[0] = map[string]any{"table": innerTable}
+				}
+			}
+		}
+	}
+
+	delete(node, "table")
+	node["subquery"] = sub
+}
+
+// stripSchemaAST rewrites three-part column references schema.table.col -> table.col
+// for every (schema, table) in strip, so they keep resolving against the derived
+// table aliased by the bare table name. In the AST a three-part reference is a
+// Dot over a two-part Column:
+//
+//	{"dot": {"field": <col>, "this": {"column": {"name": <table>, "table": <schema>}}}}
+//
+// which becomes a plain two-part column {"column": {"name": <col>, "table": <table>}}.
+func stripSchemaAST(node any, strip map[string]bool) {
+	switch v := node.(type) {
+	case map[string]any:
+		if dn, ok := v["dot"].(map[string]any); ok && stripDot(v, dn, strip) {
+			return // replaced in place; nothing deeper to strip here
+		}
+		for _, child := range v {
+			stripSchemaAST(child, strip)
+		}
+	case []any:
+		for _, child := range v {
+			stripSchemaAST(child, strip)
+		}
+	}
+}
+
+// stripDot tries to collapse a schema.table.col Dot node (held in v under "dot")
+// into a table.col Column. It reports whether it replaced the node.
+func stripDot(v, dn map[string]any, strip map[string]bool) bool {
+	this, _ := dn["this"].(map[string]any)
+	if this == nil {
+		return false
+	}
+	col, _ := this["column"].(map[string]any)
+	if col == nil {
+		return false
+	}
+	schema := identName(col["table"]) // the "sales" in sales.orders
+	table := identName(col["name"])   // the "orders" in sales.orders
+	if schema == "" || table == "" {
+		return false
+	}
+	if !strip[strings.ToLower(schema)+"\x00"+strings.ToLower(table)] {
+		return false
+	}
+	newCol := map[string]any{
+		"join_mark":         false,
+		"name":              dn["field"], // the ".col" identifier
+		"table":             col["name"], // the "orders" identifier
+		"trailing_comments": []any{},
+	}
+	delete(v, "dot")
+	v["column"] = newCol
+	return true
+}
+
+// deepCopyJSON returns a deep copy of a value decoded from JSON (maps, slices
+// and scalars), so a template can be reused without aliasing.
+func deepCopyJSON(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		m := make(map[string]any, len(x))
+		for k, val := range x {
+			m[k] = deepCopyJSON(val)
+		}
+		return m
+	case []any:
+		s := make([]any, len(x))
+		for i, val := range x {
+			s[i] = deepCopyJSON(val)
+		}
+		return s
+	default:
+		return x
+	}
 }
 
 // matches reports whether the table wrapper v is an in-scope physical table to
@@ -328,157 +521,172 @@ func (r *rewriter) matches(v map[string]any) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Per-rewrite traversal
+// AST collection: which table references to wrap (source order)
 // ---------------------------------------------------------------------------
 
-type rewriteCtx struct {
-	r     *rewriter
-	strip map[string]bool // "schema\x00table" pairs whose column refs lose the schema
+// tableDecision describes one physical-table reference found in the AST.
+type tableDecision struct {
+	wrap     bool           // wrap this reference in a filtered subquery
+	strip    bool           // outer schema.table.col refs must drop the schema
+	stripKey string         // "schema\x00table" for stripping
+	node     map[string]any // the AST {"table":...} node, mutated in place when wrapped
 }
 
-// walk traverses the JSON AST. scope is a stack of CTE-name sets in effect at
-// the current node, used to distinguish CTE references from physical tables.
-func (rc *rewriteCtx) walk(node any, scope []map[string]bool) {
+// collect walks the AST in source order, appending one tableDecision per
+// physical-table reference (including CTE references, which are recorded but
+// never wrapped). scope is the stack of CTE-name sets in effect, used to tell
+// CTE references apart from real tables.
+func (r *rewriter) collect(node any, scope []map[string]bool, out *[]*tableDecision) {
 	switch v := node.(type) {
 	case map[string]any:
 		if body := queryBody(v); body != nil {
-			rc.walkQuery(body, scope)
+			r.collectQuery(body, scope, out)
 			return
 		}
 		if t, _ := v["table"].(map[string]any); t != nil && identName(t["name"]) != "" {
-			name := strings.ToLower(identName(t["name"]))
-			if inScope(name, scope) {
-				return // CTE reference: never wrapped, never recursed
-			}
-			if rc.r.matches(v) {
-				rc.wrap(v)
-			}
-			return // a table node has no children we need to descend into
+			*out = append(*out, r.decide(v, scope))
+			return
 		}
-		for _, child := range v {
-			rc.walk(child, scope)
+		for _, k := range sortedKeys(v) {
+			r.collect(v[k], scope, out)
 		}
 	case []any:
 		for _, child := range v {
-			rc.walk(child, scope)
+			r.collect(child, scope, out)
 		}
 	}
 }
 
-// walkQuery handles a SELECT or set-operation body, pushing any CTE names it
-// declares onto the scope before descending into the query (but not into its
-// own CTE definition bodies, matching the rule that a non-recursive CTE does
-// not shadow a real table of the same name inside its own definition).
-func (rc *rewriteCtx) walkQuery(body map[string]any, scope []map[string]bool) {
-	newScope := scope
-	if w, ok := body["with"].(map[string]any); ok {
-		names := cteNames(w)
-		if list, ok := w["ctes"].([]any); ok {
-			for _, e := range list {
-				if cte, ok := e.(map[string]any); ok {
-					rc.walk(cte["this"], scope) // definition body: outer scope only
-				}
-			}
-		}
-		if len(names) > 0 {
-			newScope = append(append([]map[string]bool{}, scope...), names)
-		}
-	}
-	for k, val := range body {
-		if k == "with" {
-			continue
-		}
-		rc.walk(val, newScope)
-	}
-}
-
-// wrap replaces the table wrapper v in place with a filtered derived table.
-func (rc *rewriteCtx) wrap(v map[string]any) {
-	t := v["table"].(map[string]any)
-	name := identName(t["name"])
-	schemaW := identName(t["schema"])
-
-	// Effective alias: reuse an explicit alias verbatim (preserving its
-	// quoting); otherwise synthesize from the table name identifier.
-	var aliasID any
-	if a, ok := t["alias"].(map[string]any); ok {
-		aliasID = deepClone(a)
-	} else {
-		aliasID = deepClone(t["name"])
-		if schemaW != "" {
-			// A derived table alias cannot be schema-qualified, so columns
-			// written as schema.table.col must drop the schema.
-			rc.strip[strings.ToLower(schemaW)+"\x00"+strings.ToLower(name)] = true
-		}
-	}
-
-	// Inner table = original reference minus its alias (hints/partition/schema
-	// travel with it into the subquery, and quoting is preserved verbatim).
-	inner := deepCloneMap(v)
-	inner["table"].(map[string]any)["alias"] = nil
-
-	sub := deepCloneMap(rc.r.skeleton)
-	sq := sub["subquery"].(map[string]any)
-	sq["alias"] = aliasID
-
-	innerSel := sq["this"].(map[string]any)["select"].(map[string]any)
-	innerSel["from"].(map[string]any)["expressions"] = []any{inner}
-
-	where := deepClone(rc.r.whereExpr)
-	innerSel["where_clause"] = map[string]any{"this": where}
-
-	for k := range v {
-		delete(v, k)
-	}
-	for k, val := range sub {
-		v[k] = val
-	}
-}
-
-// applyStrip rewrites schema.table.col column references to table.col for every
-// (schema, table) pair whose derived-table alias was synthesized from a bare
-// name.
-func (rc *rewriteCtx) applyStrip(node any) {
-	if len(rc.strip) == 0 {
+// collectQuery visits a SELECT or set-operation body in source order. CTE
+// definition bodies are visited under the outer scope (a non-recursive CTE does
+// not shadow a real table of the same name inside its own definition); the rest
+// of the query sees the CTE names in scope.
+func (r *rewriter) collectQuery(body map[string]any, scope []map[string]bool, out *[]*tableDecision) {
+	if _, isSet := body["left"]; isSet {
+		newScope := r.pushCTEs(body, scope, out)
+		r.collect(body["left"], newScope, out)
+		r.collect(body["right"], newScope, out)
+		r.collect(body["order_by"], newScope, out)
 		return
 	}
-	stripDots(node, rc.strip)
-}
 
-func stripDots(node any, strip map[string]bool) {
-	switch v := node.(type) {
-	case map[string]any:
-		if dot, ok := v["dot"].(map[string]any); ok {
-			if this, ok := dot["this"].(map[string]any); ok {
-				if col, ok := this["column"].(map[string]any); ok {
-					schema := strings.ToLower(identName(col["table"]))
-					table := strings.ToLower(identName(col["name"]))
-					if schema != "" && table != "" && strip[schema+"\x00"+table] {
-						newCol := map[string]any{"column": map[string]any{
-							"name":              dot["field"], // real column identifier
-							"table":             col["name"],  // table identifier
-							"join_mark":         false,
-							"trailing_comments": []any{},
-						}}
-						for k := range v {
-							delete(v, k)
-						}
-						for k, val := range newCol {
-							v[k] = val
-						}
-						return
-					}
-				}
+	newScope := r.pushCTEs(body, scope, out)
+	r.collect(body["hint"], newScope, out)
+	r.collect(body["expressions"], newScope, out) // SELECT list (scalar subqueries)
+	r.collect(body["from"], newScope, out)
+	if joins, ok := body["joins"].([]any); ok {
+		for _, j := range joins {
+			if jm, ok := j.(map[string]any); ok {
+				r.collect(jm["this"], newScope, out) // joined table first
+				r.collect(jm["on"], newScope, out)
+				r.collect(jm["using"], newScope, out)
 			}
 		}
-		for _, child := range v {
-			stripDots(child, strip)
-		}
-	case []any:
-		for _, child := range v {
-			stripDots(child, strip)
+	}
+	for _, k := range []string{
+		"where_clause", "group_by", "having", "qualify", "windows",
+		"distinct_on", "sort_by", "order_by", "lateral_views", "connect",
+	} {
+		r.collect(body[k], newScope, out)
+	}
+}
+
+// pushCTEs visits CTE definition bodies (outer scope) and returns scope extended
+// with the CTE names declared by body.
+func (r *rewriter) pushCTEs(body map[string]any, scope []map[string]bool, out *[]*tableDecision) []map[string]bool {
+	w, ok := body["with"].(map[string]any)
+	if !ok {
+		return scope
+	}
+	if list, ok := w["ctes"].([]any); ok {
+		for _, e := range list {
+			if cte, ok := e.(map[string]any); ok {
+				r.collect(cte["this"], scope, out)
+			}
 		}
 	}
+	names := cteNames(w)
+	if len(names) > 0 {
+		return append(append([]map[string]bool{}, scope...), names)
+	}
+	return scope
+}
+
+// decide builds the tableDecision for a physical-table node v.
+func (r *rewriter) decide(v map[string]any, scope []map[string]bool) *tableDecision {
+	t := v["table"].(map[string]any)
+	name := strings.ToLower(identName(t["name"]))
+	schema := identName(t["schema"])
+
+	d := &tableDecision{node: v}
+	if inScope(name, scope) {
+		return d // CTE reference: never wrapped
+	}
+	d.wrap = r.matches(v)
+	if !d.wrap {
+		return d
+	}
+	// A derived-table alias is synthesized from the bare name when the table has
+	// no explicit alias, so schema-qualified column references (schema.table.col)
+	// must drop the schema to keep resolving.
+	if _, hasAlias := t["alias"].(map[string]any); !hasAlias && schema != "" {
+		d.strip = true
+		d.stripKey = strings.ToLower(schema) + "\x00" + name
+	}
+	return d
+}
+
+func sortedKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// ---------------------------------------------------------------------------
+// Input guard
+// ---------------------------------------------------------------------------
+
+const (
+	// maxInputBytes bounds total work and rules out adversarial giant inputs.
+	maxInputBytes = 1 << 20 // 1 MiB
+	// maxBracketDepth is a conservative cap on the nesting of grouping
+	// brackets. Polyglot's native recursive-descent parser stack-overflows on
+	// deeply nested expressions -- e.g. function calls (...), or {...}/[...]
+	// constructs -- and the crash (observed > ~150 here) cannot be recovered in
+	// Go. The cap stays well below the crash point yet far above any sane query.
+	maxBracketDepth = 64
+)
+
+// guardInput fails closed (ErrUnsupported) on input that could crash or stall
+// the native parser. It is a heuristic scan over the raw text (it does not skip
+// string/comment contents) that bounds the nesting of all grouping bracket
+// families, which can only cause a safe false rejection of bizarre input, never
+// an unsafe rewrite.
+func guardInput(sql string) error {
+	if len(sql) > maxInputBytes {
+		return fmt.Errorf("%w: input too large (%d bytes)", ErrUnsupported, len(sql))
+	}
+	depth, max := 0, 0
+	for _, c := range sql {
+		switch c {
+		case '(', '[', '{':
+			depth++
+			if depth > max {
+				max = depth
+			}
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	if max > maxBracketDepth {
+		return fmt.Errorf("%w: input nesting too deep (%d levels)", ErrUnsupported, max)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -575,18 +783,6 @@ func dropNils(in []any) []any {
 		}
 	}
 	return out
-}
-
-func deepClone(v any) any {
-	b, _ := sonic.Marshal(v)
-	var out any
-	_ = sonic.Unmarshal(b, &out)
-	return out
-}
-
-func deepCloneMap(v any) map[string]any {
-	m, _ := deepClone(v).(map[string]any)
-	return m
 }
 
 func mustMarshal(v any) json.RawMessage {

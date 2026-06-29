@@ -3,15 +3,9 @@ package easysql
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
-	"os"
 	"strings"
 	"testing"
-
-	polyglot "github.com/tobilg/polyglot/packages/go"
 )
-
-var testClient *polyglot.Client
 
 // testWhere is a verbatim WHERE expression whose single string literal
 // (testMarker) is counted to assert how many tables were wrapped.
@@ -20,20 +14,7 @@ const (
 	testMarker = "alice"
 )
 
-func TestMain(m *testing.M) {
-	// Initialize (and capture) the shared engine the same way the public API
-	// does; tests also use this client directly for AST assertions.
-	c, err := defaultClient()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "skipping easysql tests: polyglot FFI library not available:", err)
-		fmt.Fprintln(os.Stderr, "ensure the matching .ffi/ artifact for this platform is present to run them")
-		os.Exit(0)
-	}
-	testClient = c
-	os.Exit(m.Run())
-}
-
-// --- structural validators -------------------------------------------------
+// --- wrap-count validators (specific to these behavior tests) --------------
 
 // countLiterals counts string literals equal to value in sql's AST. Each wrap
 // splices the WHERE expression once, so when that expression contains exactly
@@ -81,20 +62,6 @@ func hasEmptyAlias(t *testing.T, sql, pg string) bool {
 		}
 	})
 	return empty
-}
-
-func walkJSON(node any, fn func(map[string]any)) {
-	switch v := node.(type) {
-	case map[string]any:
-		fn(v)
-		for _, c := range v {
-			walkJSON(c, fn)
-		}
-	case []any:
-		for _, c := range v {
-			walkJSON(c, fn)
-		}
-	}
 }
 
 // rewriteValid runs a rewrite and asserts: it succeeds, the output is valid SQL
@@ -192,8 +159,9 @@ func TestCTEReferencesNotWrapped(t *testing.T) {
 func TestCTEScopeSecurity(t *testing.T) {
 	sql := "select * from t union all select * from (with t as (select 1 as id) select * from t) q"
 	out := rewriteValid(t, "mysql", sql, testWhere, testMarker, 1) // exactly the real t in branch 1
-	// Be explicit: the first branch's real table must be filtered.
-	if !strings.Contains(out, "FROM (SELECT * FROM t WHERE") && !strings.Contains(out, "FROM (SELECT * FROM `t` WHERE") {
+	// Be explicit: the first branch's real table must be filtered. The generator
+	// upper-cases keywords, so look for the wrapped real table t.
+	if !strings.Contains(out, "(SELECT * FROM t WHERE") && !strings.Contains(out, "(SELECT * FROM `t` WHERE") {
 		t.Fatalf("real table t was not filtered (security regression):\n%s", out)
 	}
 }
@@ -238,6 +206,22 @@ func TestWhereSplicedVerbatim(t *testing.T) {
 		"tenant = 'acme'", "acme", 2)
 	if strings.Count(out, "'acme'") != 2 {
 		t.Fatalf("where expression not spliced verbatim into each table: %s", out)
+	}
+}
+
+// TestSchemaStrip: when a schema-qualified table gets a synthesized
+// (bare-name) derived-table alias, outer schema.table.col references must drop
+// the schema so they keep resolving against the alias. The check is
+// format-independent: the three-part reference must be gone and the two-part one
+// present.
+func TestSchemaStrip(t *testing.T) {
+	out := rewriteValid(t, "mysql",
+		"select sales.orders.id, name from sales.orders", testWhere, testMarker, 1)
+	if strings.Contains(out, "sales.orders.id") {
+		t.Fatalf("three-part column reference was not stripped to the alias:\n%s", out)
+	}
+	if !strings.Contains(out, "orders.id") {
+		t.Fatalf("expected stripped column orders.id:\n%s", out)
 	}
 }
 

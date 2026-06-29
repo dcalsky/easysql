@@ -11,7 +11,7 @@ filtered derived table.
 
 ```sql
 -- input
-SELECT * FROM a
+select * from a
 -- output (where clause "user = 'alice'")
 SELECT * FROM (SELECT * FROM a WHERE user = 'alice') AS a
 ```
@@ -20,6 +20,16 @@ Wrapping each table in its own pre-filtered subquery (instead of appending a
 single top-level `WHERE`) keeps the rewrite correct across `JOIN` / `LEFT JOIN`
 (no outer-join degradation), CTEs, subqueries and `UNION`. Only `SELECT` and set
 operations are accepted; anything else is rejected fail-closed.
+
+The rewrite operates on the parsed AST and re-emits the statement with the
+engine's generator, so the **output is normalized**: keyword casing and
+whitespace follow the generator's style and comments are not preserved.
+Identifiers and string literals are carried through unchanged (e.g. a quoted
+`"order"` stays quoted, a literal `'北京'` stays intact). The rewritten SQL is
+always re-parsed before being returned, so a call either yields valid SQL or
+fails closed (`ErrInternal`). When nothing is in scope — no table is rewritten —
+the input is returned **unchanged** (no generator round-trip, so no
+reformatting).
 
 ## Native library setup
 
@@ -84,7 +94,7 @@ use — there is nothing else to download or install.
 // No setup: the bundled engine loads on first use.
 out, err := easysql.ApplyRowFilter(`select "uid" from a`, "user = 'alice'", easysql.WithDialect("postgres"))
 if err != nil { log.Fatal(err) }
-// SELECT "uid" FROM (SELECT * FROM "a" WHERE user = 'alice') AS "a"
+// SELECT "uid" FROM (SELECT * FROM a WHERE "user" = 'alice') AS a
 ```
 
 `ApplyRowFilter` is a one-shot, stateless call — there is no client to open or
@@ -103,7 +113,7 @@ native engine eagerly instead of on first use.
 | `WithTableNames(names...)` | Restrict the WHERE clause to these tables (bare or `schema.table`).             |
 | `WithTableRegexp(pats...)` | Restrict to tables matching any Go regexp. Composes with `WithTableNames`.      |
 | `WithDefaultDB(db)`        | Schema used to resolve unqualified names against a qualified scope.             |
-| `WithSelfCheck(b)`         | Re-parse the output and fail closed (`ErrInternal`) if invalid. Off by default. |
+| `WithSelfCheck(b)`         | Deprecated no-op: the output is **always** re-parsed and the call fails closed (`ErrInternal`) if invalid, so self-checking can no longer be disabled. |
 
 
 The `whereClause` is a boolean SQL expression spliced **verbatim** as an AST
@@ -193,10 +203,19 @@ overhead on the common case.
 
 ## Design notes
 
-The transform runs directly on Polyglot's JSON AST. Each `ApplyRowFilter` call parses
-the WHERE expression and a wrapper skeleton **once**, then deep-clones and
-splices them per table, so the number of FFI calls does not grow with the table
-count.
+The transform runs directly on Polyglot's JSON AST. Each `ApplyRowFilter` call
+parses the input once, parses a wrapper-subquery template (with the predicate
+baked into its `WHERE`) **once** and caches it, then deep-clones that template
+and replaces each in-scope table node in place. The statement is rendered back
+to SQL by the engine's generator, and the result is re-parsed as a final
+validity gate. The number of FFI calls is therefore constant — it does not grow
+with the table count.
+
+Because the output comes from the generator, it is **normalized** rather than
+byte-identical to the input: keyword casing and whitespace follow the
+generator's style and comments are not preserved. Identifiers and string
+literals are carried through unchanged. A call that wraps **no** table (nothing
+in scope) skips the generator entirely and returns the input verbatim.
 
 This implementation deliberately avoids several shortcuts a naive version would
 take:
@@ -205,19 +224,22 @@ take:
 identifier. Table-valued functions (`generate_series(...)`, `TABLE(...)`,
 `UNNEST(...)`) are `function` nodes, never wrapped — so no invalid empty
 derived-table alias is ever produced. `DUAL` is also skipped.
-- **Quoting preserved.** The original table node is spliced verbatim, so a
+- **Quoting preserved.** The original table node is carried through the AST, so a
 quoted reserved word like `"order"` stays quoted (a rewrite that drops quotes
 would emit invalid SQL).
+- **Schema-qualified columns rewritten.** When a `schema.table` reference is
+wrapped under a synthesized (bare-name) alias, outer `schema.table.col`
+references are rewritten to `table.col` so they keep resolving against the
+derived table.
 - **Scope-correct CTE detection.** CTE names are tracked on a scope stack during
 the walk, not collected globally. A CTE named `t` in one branch does **not**
 cause a real table `t` in a sibling branch to be left unfiltered — a security
 bug a global CTE-name set would introduce. (`TestCTEScopeSecurity` is the
 regression, and it has been verified to fail if the scoping is weakened.) CTE
 *references* are never wrapped, only the real tables in or around them.
-- **Verbatim splice.** The WHERE expression is parsed and spliced as an AST
-node, not concatenated into the query text, so the surrounding statement is
-never disturbed. Binding/escaping of any values inside it is the caller's
-responsibility.
+- **Predicate parsed once.** The WHERE expression is parsed into the wrapper
+template and reused as an AST subtree, never concatenated into the final query
+text. Binding/escaping of any values inside it is the caller's responsibility.
 
 
 
@@ -247,13 +269,20 @@ The same check runs on Linux, macOS and Windows in CI
 
 Tests are assertion-based, not "did not panic":
 
-- `TestRewriteStructural` / `TestDialectBoundary` — every case must parse,
-rewrite, **re-parse as valid SQL**, have **no empty alias**, and wrap exactly
-the expected number of physical tables.
+- `TestRewriteStructural` / `TestDialectBoundary` / `TestRewriteCorpus` — every
+case must parse, rewrite, **re-parse as valid SQL**, have **no empty alias**, and
+wrap exactly the expected number of physical tables; `TestRewriteCorpus` also
+checks the physical-table multiset is preserved.
+- `TestRewriteInvariants` / `FuzzRewrite` — external-oracle invariants (semantic
+no-op, output validity, table-multiset preservation) over a broad dialect corpus
+and as a fuzz target. `TestInputGuard` covers the deep-nesting / oversize
+fail-closed guards.
 - `TestCTEScopeSecurity` — the real-table-left-unfiltered regression.
-- `TestQuotingPreserved`, `TestTableFunctionsNotWrapped`, `TestDualSkipped`,
-`TestUserLiteralEscaped`, `TestErrors`, `TestConfigValidation`,
-`TestSelfCheck`.
+- `TestSchemaStrip`, `TestQuotingPreserved`, `TestTableFunctionsNotWrapped`,
+`TestDualSkipped`, `TestWhereSplicedVerbatim`, `TestErrors`,
+`TestConfigValidation`, `TestSelfCheck`.
+- `BenchmarkRewrite` — steady-state per-call rewrite cost over a representative
+corpus (`go test -bench=. -run='^$'`).
 - `TestTrino*` (in `lineage_test.go`) — the full set of column-lineage cases:
 wildcard + `WHERE`, duplicate qualified columns, ambiguous bare columns,
 expression/function columns, and CTE-to-root resolution.
