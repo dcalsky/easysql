@@ -4,13 +4,14 @@ Go library for SQL analysis and rewriting, built on the
 [Polyglot SQL](https://github.com/tobilg/polyglot) engine (multi-dialect,
 sqlglot-compatible parser over FFI).
 
-Three capabilities, one dependency:
+Four capabilities, one dependency:
 
 | Function | Purpose |
 | -------- | ------- |
 | [`ApplyRowFilter`](#applyrowfilter) | Rewrite `SELECT` statements to enforce row-level access policies |
 | [`LineageSourceColumns`](#lineagesourcecolumns) | Trace which source-table columns flow into a query's result |
 | [`ParseColumns`](#parsecolumns) | List the column names a statement exposes |
+| [`ReferencedColumns`](#referencedcolumns) | List every column a statement touches (projection + filters), per table |
 
 Supported dialects include PostgreSQL, Trino/Presto, StarRocks, and MySQL.
 
@@ -172,6 +173,54 @@ cols, err := easysql.ParseColumns(`
 | `INSERT INTO t VALUES (…)` without column list | `ErrUnsupported` |
 
 Reuses `WithLineageDialect` and `WithLineageMetadata` from the lineage options.
+
+### ReferencedColumns
+
+`ReferencedColumns` returns, for each root physical table, the columns the
+statement touches **anywhere** — projection, `WHERE`, `JOIN … ON`, `GROUP BY`,
+`HAVING`, `ORDER BY`, `QUALIFY`, and window clauses alike. It is the complement
+of `LineageSourceColumns` (which reports only columns that *flow into the
+result*) and is a **superset** of it: a column appearing only in a filter
+position is included here but not there.
+
+```go
+// SELECT a FROM t WHERE b > 1
+ref, _     := easysql.ReferencedColumns("SELECT a FROM t WHERE b > 1", easysql.WithLineageDialect("trino"))
+// map[string][]string{"t": {"a", "b"}}   -- b is a filter column
+lineage, _ := easysql.LineageSourceColumns("SELECT a FROM t WHERE b > 1", easysql.WithLineageDialect("trino"))
+// map[string][]string{"t": {"a"}}        -- b does not reach the result
+```
+
+The native engine does not expose the source table of a filter-position column,
+so resolution is done structurally on the AST by a recursive scope resolver:
+each query level maps its FROM/JOIN aliases to a source (a physical table, or —
+for a CTE or derived subquery — its recursively resolved output→root mapping),
+then attributes every referenced column to its root physical table.
+
+| Behavior | Detail |
+| -------- | ------ |
+| Filter positions | `WHERE`, `JOIN … ON`, `USING`, `GROUP BY`, `HAVING`, `ORDER BY`, `QUALIFY`, window `PARTITION BY` all counted |
+| CTEs / derived subqueries | Seen through to root physical tables |
+| Correlated / `IN` / `EXISTS` / `ANY` / scalar subqueries | Resolved as their own scopes (outer refs via correlation) |
+| Set operations | `UNION`/`INTERSECT`/`EXCEPT` branches merged |
+| `FROM` constructs | `PIVOT`, `UNNEST`, `LATERAL VIEW`, self-joins resolved |
+| DML | `DELETE … WHERE`, `UPDATE … SET … FROM … WHERE`, `MERGE … ON … WHEN` read columns are captured |
+| Qualified `t.c` / `cat.sch.tbl.c` | Attributed to the resolved table |
+| Unqualified `c` | Attributed to tables declaring it in `WithLineageMetadata`; with no metadata, to every physical source in scope (safe superset) |
+| `SELECT *` / `t.*` | Expanded via metadata; otherwise the sentinel `"*"` |
+| Tables with no referenced column | Still present with an empty list |
+
+It accepts the same query-bearing statements as `LineageSourceColumns`
+(`SELECT`/`UNION`, `CREATE VIEW`, `CREATE TABLE AS SELECT`, `INSERT … SELECT`, …)
+plus the DML mutations above, and reuses `WithLineageDialect` /
+`WithLineageMetadata`. Use it for access-control / masking decisions, where a
+column read in a `WHERE` still counts as "touched".
+
+**Fail-open by design.** The result is meant to over- rather than
+under-approximate: a reference whose table cannot be resolved (an unknown alias,
+a column absent from incomplete metadata, an unexpanded `SELECT *`) is
+*broadcast* to every candidate physical table in scope instead of being dropped.
+For an access-control caller, an extra column is harmless; a missing one is not.
 
 ## Errors
 
