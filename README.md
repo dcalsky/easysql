@@ -98,7 +98,7 @@ if err != nil { log.Fatal(err) }
 ```
 
 `ApplyRowFilter` is a one-shot, stateless call — there is no client to open or
-constructor to keep around, mirroring `SourceTableColumns` below. It is safe for
+constructor to keep around, mirroring `LineageSourceColumns` below. It is safe for
 concurrent use. Call `easysql.Init()` at startup if you want to validate the
 native engine eagerly instead of on first use.
 
@@ -125,7 +125,7 @@ error.
 
 ## Column-level lineage
 
-For every root physical source table, `SourceTableColumns` returns the
+For every root physical source table, `LineageSourceColumns` returns the
 **source columns that flow into the statement's result** — columns appearing
 only in filter positions (`WHERE`, `JOIN ... ON`, `GROUP BY`, `ORDER BY`, …) are
 excluded. It mirrors the semantics of sqllineage's `get_source_table_columns`.
@@ -136,7 +136,7 @@ as well as `CREATE VIEW`, `CREATE TABLE AS SELECT` and `INSERT ... SELECT`
 even when no column flows from it.
 
 ```go
-cols, err := easysql.SourceTableColumns(`
+cols, err := easysql.LineageSourceColumns(`
     CREATE VIEW hive.analytics.v_paid_orders AS
     WITH paid_orders AS (
         SELECT o.order_id, o.user_id, p.paid_amount
@@ -194,12 +194,56 @@ returns their source columns.
 
 
 There is no process pool or LRU cache: Polyglot runs in native code and the
-client is concurrency-safe, so callers can invoke `SourceTableColumns` directly
-and layer their own caching if needed. `SourceTableColumnsConcurrent` is a
+client is concurrency-safe, so callers can invoke `LineageSourceColumns` directly
+and layer their own caching if needed. `LineageSourceColumnsConcurrent` is a
 drop-in variant with identical options, semantics and result that analyzes the
 leaf `SELECT`s of a set operation (`UNION` / `INTERSECT` / `EXCEPT`) in parallel;
 a single-`SELECT` statement takes the same serial path, so there is no goroutine
 overhead on the common case.
+
+## ParseColumns
+
+`ParseColumns` returns the **field names a statement exposes**, in left-to-right
+projection order. It is the complement of `LineageSourceColumns`: instead of
+tracing which source-table columns flow into the result, it names the columns
+that consumers of a view, table or query would see.
+
+It accepts query-bearing statements (`SELECT`, `WITH`, `UNION`, `CREATE VIEW`,
+`CREATE TABLE AS SELECT`, `INSERT ... SELECT`, …) as well as DDL that declares
+columns directly (`CREATE TABLE (…)`, `CREATE TABLE … (LIKE …)`, `INSERT INTO t
+(a, b) VALUES …`). Wrappers are unwrapped to their inner query; an explicit
+column list on `CREATE VIEW`, `CREATE TABLE` or `INSERT` overrides names
+inferred from the `SELECT` list.
+
+```go
+cols, err := easysql.ParseColumns(`
+    CREATE VIEW hive.analytics.v AS
+    SELECT u.user_name, o.amount AS amt
+    FROM hive.raw.users u
+    JOIN hive.raw.orders o ON u.user_id = o.user_id`,
+    easysql.WithLineageDialect("trino"),
+)
+// []string{"user_name", "amt"}
+```
+
+On top of Polyglot's `AnalyzeQuery` projections:
+
+- **Unaliased expressions** are named `_col{index}` (0-based position in the
+  `SELECT` list), matching Trino's default naming.
+- **Wildcards** (`SELECT *`, `t.*`) expand when `WithLineageMetadata` supplies
+  table catalogs; without metadata an unexpanded star appears as `"*"`. For
+  multi-table `SELECT *` every referenced base table must appear in metadata,
+  otherwise the result falls back to `["*"]`.
+- **`CREATE TABLE … (LIKE other)`** requires metadata for the source table;
+  bare table names match metadata keys by suffix (e.g. `other` matches
+  `c.s.other`).
+- **Statically unknowable shapes** (`INSERT INTO t VALUES (…)` with no target
+  column list) return `ErrUnsupported`.
+
+Reuses the lineage options `WithLineageDialect` and `WithLineageMetadata`
+(`WithLineageProducer` / `WithLineageNamespace` are accepted but do not affect
+the result). See `parse_columns_test.go` for the full Trino scenario suite
+(real-world views, CTAS, CTEs, quoted aliases, partial metadata, …).
 
 ## Design notes
 
@@ -286,4 +330,7 @@ corpus (`go test -bench=. -run='^$'`).
 - `TestTrino*` (in `lineage_test.go`) — the full set of column-lineage cases:
 wildcard + `WHERE`, duplicate qualified columns, ambiguous bare columns,
 expression/function columns, and CTE-to-root resolution.
+- `TestParseColumns*` (in `parse_columns_test.go`) — column-name extraction
+for `CREATE VIEW` / `CREATE TABLE` / `INSERT` / `WITH` / wildcard expansion,
+ported from the Python `view_columns` suite.
 

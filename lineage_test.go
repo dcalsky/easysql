@@ -22,18 +22,18 @@ var trinoMetadata = map[string][]string{
 	"hive.raw.payments": {"order_id", "paid_amount", "paid_at"},
 }
 
-// assertSourceTableColumns is the Go analogue of the Python helper of the same
+// assertLineageSourceColumns is the Go analogue of the Python helper of the same
 // name: it runs the Trino lineage analysis and asserts the exact table->columns
 // result (columns are compared order-insensitively, since the API sorts them).
-func assertSourceTableColumns(t *testing.T, name, sql string, expected map[string][]string) {
+func assertLineageSourceColumns(t *testing.T, name, sql string, expected map[string][]string) {
 	t.Helper()
-	actual, err := SourceTableColumns(
+	actual, err := LineageSourceColumns(
 		sql,
 		WithLineageDialect("trino"),
 		WithLineageMetadata(trinoMetadata),
 	)
 	if err != nil {
-		t.Fatalf("%s: SourceTableColumns: %v", name, err)
+		t.Fatalf("%s: LineageSourceColumns: %v", name, err)
 	}
 	want := map[string][]string{}
 	for table, cols := range expected {
@@ -50,7 +50,7 @@ func assertSourceTableColumns(t *testing.T, name, sql string, expected map[strin
 }
 
 func TestTrinoCatalogSchemaTableWithWildcardAndWhere(t *testing.T) {
-	assertSourceTableColumns(t,
+	assertLineageSourceColumns(t,
 		"trino_catalog_schema_table_with_wildcard_and_where",
 		`
         CREATE VIEW hive.analytics.v_user_orders AS
@@ -76,7 +76,7 @@ func TestTrinoCatalogSchemaTableWithWildcardAndWhere(t *testing.T) {
 }
 
 func TestTrinoDuplicateColumnWithQualifiedSourcesAndWhere(t *testing.T) {
-	assertSourceTableColumns(t,
+	assertLineageSourceColumns(t,
 		"trino_duplicate_column_with_qualified_sources_and_where",
 		`
         CREATE VIEW hive.analytics.v_user_ids AS
@@ -96,7 +96,7 @@ func TestTrinoDuplicateColumnWithQualifiedSourcesAndWhere(t *testing.T) {
 }
 
 func TestTrinoAmbiguousBareDuplicateColumnWithWhere(t *testing.T) {
-	assertSourceTableColumns(t,
+	assertLineageSourceColumns(t,
 		"trino_ambiguous_bare_duplicate_column_with_where",
 		`
         CREATE VIEW hive.analytics.v_ambiguous_user_id AS
@@ -113,7 +113,7 @@ func TestTrinoAmbiguousBareDuplicateColumnWithWhere(t *testing.T) {
 }
 
 func TestTrinoExpressionAndFunctionColumnsWithWhere(t *testing.T) {
-	assertSourceTableColumns(t,
+	assertLineageSourceColumns(t,
 		"trino_expression_and_function_columns_with_where",
 		`
         CREATE VIEW hive.analytics.v_order_metrics AS
@@ -134,7 +134,7 @@ func TestTrinoExpressionAndFunctionColumnsWithWhere(t *testing.T) {
 }
 
 func TestTrinoCteResolvesToRootSourceTablesWithWhere(t *testing.T) {
-	assertSourceTableColumns(t,
+	assertLineageSourceColumns(t,
 		"trino_cte_resolves_to_root_source_tables_with_where",
 		`
         CREATE VIEW hive.analytics.v_paid_orders AS
@@ -270,7 +270,7 @@ func TestLineageAcrossStatementTypes(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assertSourceTableColumns(t, tc.name, tc.sql, tc.expected)
+			assertLineageSourceColumns(t, tc.name, tc.sql, tc.expected)
 		})
 	}
 }
@@ -284,12 +284,12 @@ func TestLineagePlainSelectMatchesEquivalentCreateView(t *testing.T) {
                   JOIN hive.raw.orders o ON u.user_id = o.user_id
                   WHERE o.status = 'PAID'`
 
-	plain, err := SourceTableColumns(body,
+	plain, err := LineageSourceColumns(body,
 		WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata))
 	if err != nil {
 		t.Fatalf("plain select: %v", err)
 	}
-	view, err := SourceTableColumns("CREATE VIEW hive.x.v AS "+body,
+	view, err := LineageSourceColumns("CREATE VIEW hive.x.v AS "+body,
 		WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata))
 	if err != nil {
 		t.Fatalf("create view: %v", err)

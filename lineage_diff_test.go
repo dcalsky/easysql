@@ -33,27 +33,27 @@ func loadDiffQueries(tb testing.TB) (queries []struct {
 	return queries, metadata
 }
 
-// BenchmarkSourceTableColumns measures cold (uncached) per-call latency over the
+// BenchmarkLineageSourceColumns measures cold (uncached) per-call latency over the
 // shared differential query set. Run with:
 //
-//	LINEAGE_DUMP=/tmp/lineage_cmp go test -run x -bench BenchmarkSourceTableColumns -benchtime 1400x
-func BenchmarkSourceTableColumns(b *testing.B) {
+//	LINEAGE_DUMP=/tmp/lineage_cmp go test -run x -bench BenchmarkLineageSourceColumns -benchtime 1400x
+func BenchmarkLineageSourceColumns(b *testing.B) {
 	queries, metadata := loadDiffQueries(b)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		q := queries[i%len(queries)]
-		if _, err := SourceTableColumns(q.SQL,
+		if _, err := LineageSourceColumns(q.SQL,
 			WithLineageDialect("trino"), WithLineageMetadata(metadata)); err != nil {
 			b.Fatalf("%s: %v", q.Name, err)
 		}
 	}
 }
 
-// BenchmarkSourceTableColumnsParallel measures throughput under concurrency. The
+// BenchmarkLineageSourceColumnsParallel measures throughput under concurrency. The
 // Polyglot client is safe for concurrent use, so this scales across cores with
 // no extra machinery (the Python port needed a process pool to do the same).
-func BenchmarkSourceTableColumnsParallel(b *testing.B) {
+func BenchmarkLineageSourceColumnsParallel(b *testing.B) {
 	queries, metadata := loadDiffQueries(b)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -62,7 +62,7 @@ func BenchmarkSourceTableColumnsParallel(b *testing.B) {
 		for pb.Next() {
 			q := queries[i%len(queries)]
 			i++
-			if _, err := SourceTableColumns(q.SQL,
+			if _, err := LineageSourceColumns(q.SQL,
 				WithLineageDialect("trino"), WithLineageMetadata(metadata)); err != nil {
 				b.Fatalf("%s: %v", q.Name, err)
 			}
@@ -82,7 +82,7 @@ func TestLineageDumpForDiff(t *testing.T) {
 
 	out := map[string]any{}
 	for _, q := range queries {
-		res, err := SourceTableColumns(q.SQL,
+		res, err := LineageSourceColumns(q.SQL,
 			WithLineageDialect("trino"), WithLineageMetadata(metadata))
 		if err != nil {
 			out[q.Name] = map[string]string{"__error__": err.Error()}
