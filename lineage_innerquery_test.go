@@ -8,16 +8,16 @@ import (
 )
 
 // These tests answer a concrete question: is innerQuery (the unwrap step in
-// SourceTableColumns) actually necessary, or could the raw statement be handed
+// LineageSourceColumns) actually necessary, or could the raw statement be handed
 // straight to the native engine?
 //
-// They probe the two engine calls SourceTableColumns depends on and show that
+// They probe the two engine calls LineageSourceColumns depends on and show that
 // the engine rejects the wrapping statements (CREATE VIEW / CREATE TABLE AS /
 // INSERT ... SELECT) but accepts the query body innerQuery extracts. They also
 // pin down innerQuery's "no query" guard for statements like CREATE TABLE (...)
 // and DROP.
 
-// engineProbe runs the two native-engine calls SourceTableColumns relies on —
+// engineProbe runs the two native-engine calls LineageSourceColumns relies on —
 // AnalyzeQuery (used by sourceTables) and OpenLineageColumnLineage (used by
 // aggregateColumns) — against an arbitrary SQL string and reports whether each
 // one succeeded.
@@ -40,7 +40,7 @@ func engineProbe(t *testing.T, sql string) (analyzeOK, lineageOK bool) {
 	return aerr == nil, lerr == nil
 }
 
-// unwrapToInnerSQL reproduces the prefix of SourceTableColumns that innerQuery
+// unwrapToInnerSQL reproduces the prefix of LineageSourceColumns that innerQuery
 // powers: parse the first statement, unwrap it to its query body, and render
 // that body back to SQL. ok is false when innerQuery reports "no query"
 // (e.g. CREATE TABLE (...) / DROP).
@@ -64,7 +64,7 @@ func unwrapToInnerSQL(t *testing.T, sql string) (innerSQL string, ok bool) {
 
 // TestInnerQueryUnwrapIsRequiredByEngine proves the unwrap step is load-bearing
 // rather than redundant: for every wrapping statement the native engine rejects
-// the raw statement on at least one of the two calls SourceTableColumns makes,
+// the raw statement on at least one of the two calls LineageSourceColumns makes,
 // yet accepts the body innerQuery extracts on both. Remove innerQuery and feed
 // the raw statement to the engine and these cases would error.
 func TestInnerQueryUnwrapIsRequiredByEngine(t *testing.T) {
@@ -105,7 +105,7 @@ func TestInnerQueryUnwrapIsRequiredByEngine(t *testing.T) {
 
 // TestInnerQueryNonQueryStatementsReturnNil pins down the other half of
 // innerQuery's job: a statement with no query at all returns nil, which lets
-// SourceTableColumns short-circuit to an empty result instead of surfacing the
+// LineageSourceColumns short-circuit to an empty result instead of surfacing the
 // engine errors these statements would otherwise trigger.
 func TestInnerQueryNonQueryStatementsReturnNil(t *testing.T) {
 	cases := []struct {
@@ -119,7 +119,7 @@ func TestInnerQueryNonQueryStatementsReturnNil(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Sanity: the engine cannot analyze these directly, so the nil
-			// guard is what keeps SourceTableColumns from erroring.
+			// guard is what keeps LineageSourceColumns from erroring.
 			if analyzeOK, lineageOK := engineProbe(t, tc.sql); analyzeOK || lineageOK {
 				t.Fatalf("engine unexpectedly accepted %q: analyzeOK=%v lineageOK=%v", tc.sql, analyzeOK, lineageOK)
 			}
@@ -132,13 +132,13 @@ func TestInnerQueryNonQueryStatementsReturnNil(t *testing.T) {
 				t.Fatalf("innerQuery(%q) = non-nil; want nil for a statement with no query", tc.sql)
 			}
 
-			got, err := SourceTableColumns(tc.sql,
+			got, err := LineageSourceColumns(tc.sql,
 				WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata))
 			if err != nil {
-				t.Fatalf("SourceTableColumns(%q): %v", tc.sql, err)
+				t.Fatalf("LineageSourceColumns(%q): %v", tc.sql, err)
 			}
 			if len(got) != 0 {
-				t.Fatalf("SourceTableColumns(%q) = %v; want empty result", tc.sql, got)
+				t.Fatalf("LineageSourceColumns(%q) = %v; want empty result", tc.sql, got)
 			}
 		})
 	}
@@ -203,10 +203,10 @@ func TestInnerQueryUnwrapCoverage(t *testing.T) {
 			}
 			t.Logf("unwrapped body: %s", innerSQL)
 
-			got, err := SourceTableColumns(tc.sql,
+			got, err := LineageSourceColumns(tc.sql,
 				WithLineageDialect(tc.dialect), WithLineageMetadata(trinoMetadata))
 			if err != nil {
-				t.Fatalf("SourceTableColumns [%s] %q: %v", tc.dialect, tc.sql, err)
+				t.Fatalf("LineageSourceColumns [%s] %q: %v", tc.dialect, tc.sql, err)
 			}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("%s lineage = %v; want %v", tc.name, got, want)
@@ -216,7 +216,7 @@ func TestInnerQueryUnwrapCoverage(t *testing.T) {
 }
 
 // TestInnerQueryUnsupportedShapes pins down the statements innerQuery does NOT
-// unwrap today, returning nil (and so making SourceTableColumns yield an empty
+// unwrap today, returning nil (and so making LineageSourceColumns yield an empty
 // result rather than an engine error). Two groups:
 //
 //   - "correctly empty": statements with no source query that flows into a
@@ -248,13 +248,13 @@ func TestInnerQueryUnsupportedShapes(t *testing.T) {
 			if _, found := innerQueryFound(t, tc.dialect, tc.sql); found {
 				t.Fatalf("innerQuery unexpectedly unwrapped %s; update the coverage tests", tc.name)
 			}
-			got, err := SourceTableColumns(tc.sql,
+			got, err := LineageSourceColumns(tc.sql,
 				WithLineageDialect(tc.dialect), WithLineageMetadata(trinoMetadata))
 			if err != nil {
-				t.Fatalf("SourceTableColumns [%s] %q: %v", tc.dialect, tc.sql, err)
+				t.Fatalf("LineageSourceColumns [%s] %q: %v", tc.dialect, tc.sql, err)
 			}
 			if len(got) != 0 {
-				t.Fatalf("%s: SourceTableColumns = %v; want empty (current behavior)", tc.name, got)
+				t.Fatalf("%s: LineageSourceColumns = %v; want empty (current behavior)", tc.name, got)
 			}
 			if tc.gap {
 				t.Logf("KNOWN GAP: %s reads hive.raw.orders but lineage is empty today", tc.name)

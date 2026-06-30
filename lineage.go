@@ -21,7 +21,7 @@
 // Unlike the Python version there is no process pool or LRU cache here: that
 // infrastructure existed only to work around CPython's GIL for a pure-Python
 // parser. The Polyglot client does the heavy lifting in native code and is safe
-// for concurrent use, so callers can call SourceTableColumns directly (and add
+// for concurrent use, so callers can call LineageSourceColumns directly (and add
 // their own caching if desired).
 
 package easysql
@@ -55,7 +55,7 @@ var innerQueryKeys = []string{"query", "as_select", "expression", "this"}
 // setOpBranchKeys are the AST keys holding the operands of a set operation.
 var setOpBranchKeys = []string{"left", "right", "this", "expression"}
 
-// lineageOptions configures a SourceTableColumns call.
+// lineageOptions configures a LineageSourceColumns or ParseColumns call.
 type lineageOptions struct {
 	dialect   string
 	producer  string
@@ -63,7 +63,7 @@ type lineageOptions struct {
 	metadata  map[string][]string
 }
 
-// LineageOption configures SourceTableColumns.
+// LineageOption configures LineageSourceColumns and ParseColumns.
 type LineageOption func(*lineageOptions)
 
 // WithLineageDialect selects the SQL dialect used to parse and analyze the
@@ -76,7 +76,7 @@ func WithLineageDialect(dialect string) LineageOption {
 // WithLineageProducer sets the OpenLineage `_producer` URI recorded on the
 // emitted lineage events. It is pure provenance metadata that identifies the
 // program producing the lineage; it does not affect the source-column result
-// SourceTableColumns returns. It defaults to lineageProducer.
+// LineageSourceColumns returns. It defaults to lineageProducer.
 func WithLineageProducer(producer string) LineageOption {
 	return func(o *lineageOptions) { o.producer = producer }
 }
@@ -84,7 +84,7 @@ func WithLineageProducer(producer string) LineageOption {
 // WithLineageNamespace sets the OpenLineage dataset namespace used for the
 // input/output datasets of the emitted lineage events. Like the producer it is
 // pure provenance metadata and does not affect the source-column result
-// SourceTableColumns returns. It defaults to lineageNamespace.
+// LineageSourceColumns returns. It defaults to lineageNamespace.
 func WithLineageNamespace(namespace string) LineageOption {
 	return func(o *lineageOptions) { o.namespace = namespace }
 }
@@ -98,7 +98,7 @@ func WithLineageMetadata(metadata map[string][]string) LineageOption {
 	return func(o *lineageOptions) { o.metadata = metadata }
 }
 
-// SourceTableColumns returns, for each physical source table referenced by sql,
+// LineageSourceColumns returns, for each physical source table referenced by sql,
 // the sorted list of source columns that flow into the statement's result. It
 // works for any statement that contains a query (SELECT, UNION, CREATE VIEW,
 // CREATE TABLE AS, INSERT ... SELECT, ...).
@@ -108,7 +108,7 @@ func WithLineageMetadata(metadata map[string][]string) LineageOption {
 // "hive.raw.orders"); every source table appears in the map even when no column
 // flows from it. The native SQL engine is loaded automatically on first use
 // (see Init), so no setup is required.
-func SourceTableColumns(sql string, opts ...LineageOption) (map[string][]string, error) {
+func LineageSourceColumns(sql string, opts ...LineageOption) (map[string][]string, error) {
 	client, err := defaultClient()
 	if err != nil {
 		return nil, err
@@ -142,7 +142,7 @@ func SourceTableColumns(sql string, opts ...LineageOption) (map[string][]string,
 
 // lineageRequest carries everything the per-leaf analysis loop needs. It is
 // produced once by prepareLineage and then consumed by both the serial
-// (SourceTableColumns) and the concurrent (SourceTableColumnsConcurrent)
+// (LineageSourceColumns) and the concurrent (LineageSourceColumnsConcurrent)
 // drivers, so the two differ only in how they iterate the leaves — making the
 // serial-vs-concurrent benchmark an apples-to-apples comparison.
 type lineageRequest struct {

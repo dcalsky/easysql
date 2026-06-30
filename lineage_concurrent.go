@@ -1,5 +1,5 @@
 // This file adds a concurrent driver for column-level SQL lineage. It reuses
-// the exact setup and per-leaf analysis of the serial SourceTableColumns
+// the exact setup and per-leaf analysis of the serial LineageSourceColumns
 // (lineage.go) and only changes how the leaf SELECTs are iterated: when a
 // statement splits into more than one leaf (a UNION / INTERSECT / EXCEPT), the
 // leaves are analyzed in parallel instead of one after another.
@@ -8,14 +8,14 @@ package easysql
 
 import "sync"
 
-// SourceTableColumnsConcurrent is a drop-in alternative to SourceTableColumns
+// LineageSourceColumnsConcurrent is a drop-in alternative to LineageSourceColumns
 // that analyzes the leaf SELECTs of a set operation (UNION / INTERSECT /
 // EXCEPT) concurrently. Options, semantics and result are identical to the
 // serial version; only the leaf iteration differs.
 //
 // Concurrency is engaged only when the statement actually splits into more than
 // one leaf. The overwhelmingly common single-SELECT statement takes the very
-// same serial path as SourceTableColumns (no goroutines, and the already
+// same serial path as LineageSourceColumns (no goroutines, and the already
 // rendered inner SQL is reused), so there is no goroutine overhead to pay on
 // the hot path.
 //
@@ -33,7 +33,7 @@ import "sync"
 // operations.
 const maxLineageConcurrency = 4
 
-func SourceTableColumnsConcurrent(sql string, opts ...LineageOption) (map[string][]string, error) {
+func LineageSourceColumnsConcurrent(sql string, opts ...LineageOption) (map[string][]string, error) {
 	client, err := defaultClient()
 	if err != nil {
 		return nil, err
@@ -44,7 +44,7 @@ func SourceTableColumnsConcurrent(sql string, opts ...LineageOption) (map[string
 	}
 
 	// Common path: zero or one leaf. Reuse the inner SQL already rendered by
-	// prepareLineage and stay fully serial — identical to SourceTableColumns.
+	// prepareLineage and stay fully serial — identical to LineageSourceColumns.
 	if len(req.leaves) <= 1 {
 		for range req.leaves {
 			if err := aggregateColumns(client, req.innerSQL, req.cfg, req.schema, req.tableCols); err != nil {
