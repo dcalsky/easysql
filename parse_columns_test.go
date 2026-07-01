@@ -180,6 +180,22 @@ func TestParseColumnsStarWithoutMetadataReturnsStar(t *testing.T) {
 	)
 }
 
+func TestParseColumnsStarWithExplicitEmptyTableMetadataReturnsEmpty(t *testing.T) {
+	assertParseColumns(t, "star_with_explicit_empty_table_metadata_returns_empty",
+		"SELECT * FROM hive.raw.users",
+		[]string{},
+		WithLineageMetadata(map[string][]string{"hive.raw.users": {}}),
+	)
+}
+
+func TestParseColumnsQualifiedStarWithExplicitEmptyTableMetadataReturnsEmpty(t *testing.T) {
+	assertParseColumns(t, "qualified_star_with_explicit_empty_table_metadata_returns_empty",
+		"SELECT u.* FROM hive.raw.users u",
+		[]string{},
+		WithLineageMetadata(map[string][]string{"hive.raw.users": {}}),
+	)
+}
+
 func TestParseColumnsStarWithMetadataIsExpanded(t *testing.T) {
 	assertParseColumns(t, "star_with_metadata_is_expanded",
 		"SELECT u.name, o.* FROM hive.raw.users u JOIN hive.raw.orders o ON u.id = o.uid",

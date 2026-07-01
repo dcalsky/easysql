@@ -26,9 +26,11 @@ import (
 // INSERT overrides names inferred from the SELECT list.
 //
 // Wildcards (SELECT *, t.*) expand when WithLineageMetadata supplies table
-// catalogs; without metadata an unexpanded star appears as "*". For multi-table
-// SELECT * every referenced base table must appear in metadata or the result
-// falls back to ["*"].
+// catalogs. A table absent from metadata means its schema was not provided and
+// an unexpanded star falls back to ["*"]. A table present with an empty column
+// list means the table is known to expose zero columns. For multi-table SELECT *
+// every referenced base table must appear in metadata or the result falls back
+// to ["*"].
 //
 // CREATE TABLE ... (LIKE other) requires WithLineageMetadata for the source
 // table. INSERT INTO t VALUES (...) without a target column list cannot be
@@ -319,7 +321,13 @@ func columnsFromAnalysis(a polyglot.QueryAnalysis, metadata map[string][]string)
 		p := a.Projections[i]
 		if p.IsStar {
 			if sp, ok := starByIndex[p.Index]; ok {
-				if expanded := orderStarColumns(sp, a, metadata); len(expanded) > 0 {
+				if len(sp.ExpandedColumns) == 0 {
+					if cols, known := resolveStarFromMetadata(sp, a, metadata); known {
+						out = append(out, cols...)
+						i++
+						continue
+					}
+				} else if expanded := orderStarColumns(sp, a, metadata); len(expanded) > 0 {
 					out = append(out, expanded...)
 					i++
 					continue
@@ -394,6 +402,10 @@ func spansMultipleMetadataTables(cols []string, metadata map[string][]string) bo
 
 func orderStarColumns(sp polyglot.StarProjectionFact, a polyglot.QueryAnalysis, metadata map[string][]string) []string {
 	if len(sp.ExpandedColumns) == 0 {
+		cols, ok := resolveStarFromMetadata(sp, a, metadata)
+		if ok {
+			return cols
+		}
 		return nil
 	}
 	if sp.Table != nil && *sp.Table != "" {
@@ -513,6 +525,9 @@ func needsStarFallback(a polyglot.QueryAnalysis, metadata map[string][]string) b
 			continue
 		}
 		if len(sp.ExpandedColumns) == 0 {
+			if allBaseTablesInMetadata(a.BaseTables, metadata) {
+				continue
+			}
 			return true
 		}
 		if len(a.BaseTables) > 1 && !allBaseTablesInMetadata(a.BaseTables, metadata) {
@@ -529,6 +544,48 @@ func needsStarFallback(a polyglot.QueryAnalysis, metadata map[string][]string) b
 		}
 	}
 	return false
+}
+
+// resolveStarFromMetadata expands a star projection from metadata when the engine
+// could not. ok is true when every star target table is present in metadata, even
+// if its column list is empty (meaning the table exposes zero columns).
+func resolveStarFromMetadata(sp polyglot.StarProjectionFact, a polyglot.QueryAnalysis, metadata map[string][]string) ([]string, bool) {
+	if sp.Table != nil && *sp.Table != "" {
+		qual := *sp.Table
+		for _, bt := range a.BaseTables {
+			if bt.Alias != nil && *bt.Alias == qual {
+				if cols, ok := lookupMetadataColumns(metadata, bt.Name); ok {
+					return cols, true
+				}
+			}
+			if bt.Name == qual || strings.HasSuffix(bt.Name, "."+qual) {
+				if cols, ok := lookupMetadataColumns(metadata, bt.Name); ok {
+					return cols, true
+				}
+			}
+		}
+		if cols, ok := lookupMetadataColumns(metadata, qual); ok {
+			return cols, true
+		}
+		return nil, false
+	}
+
+	if len(a.BaseTables) == 1 {
+		if cols, ok := lookupMetadataColumns(metadata, a.BaseTables[0].Name); ok {
+			return cols, true
+		}
+		return nil, false
+	}
+
+	if !allBaseTablesInMetadata(a.BaseTables, metadata) {
+		return nil, false
+	}
+	var out []string
+	for _, bt := range a.BaseTables {
+		cols, _ := lookupMetadataColumns(metadata, bt.Name)
+		out = append(out, cols...)
+	}
+	return out, true
 }
 
 func allBaseTablesInMetadata(baseTables []polyglot.RelationFact, metadata map[string][]string) bool {
