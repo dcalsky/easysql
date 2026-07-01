@@ -167,7 +167,7 @@ cols, err := easysql.ParseColumns(`
 | Behavior | Detail |
 | -------- | ------ |
 | Unaliased expressions | Named `_col{index}` (Trino convention) |
-| `SELECT *` / `t.*` | Expanded via `WithLineageMetadata`; without metadata returns `["*"]` |
+| `SELECT *` / `t.*` | Expanded via `WithLineageMetadata`; table absent from metadata → `["*"]`; table present with `[]` → `[]` |
 | Multi-table `SELECT *` | All base tables must be in metadata, else `["*"]` |
 | `CREATE TABLE … (LIKE t)` | Requires metadata for the source table |
 | `INSERT INTO t VALUES (…)` without column list | `ErrUnsupported` |

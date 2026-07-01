@@ -305,3 +305,110 @@ func TestLineagePlainSelectMatchesEquivalentCreateView(t *testing.T) {
 		t.Fatalf("unexpected lineage:\n got:  %v\n want: %v", plain, want)
 	}
 }
+
+func TestLineageSimpleSelectFromFoo(t *testing.T) {
+	metadata := map[string][]string{
+		"foo": {"a", "b"},
+		"boo": {"b"},
+	}
+	actual, err := LineageSourceColumns(
+		"SELECT a, b FROM foo",
+		WithLineageDialect("trino"),
+		WithLineageMetadata(metadata),
+	)
+	if err != nil {
+		t.Fatalf("LineageSourceColumns: %v", err)
+	}
+	want := map[string][]string{
+		"foo": {"a", "b"},
+	}
+	if !reflect.DeepEqual(actual, want) {
+		t.Fatalf("expected: %v\nactual:   %v", want, actual)
+	}
+}
+
+// assertLineageWithMetadata runs lineage with a custom metadata catalog.
+func assertLineageWithMetadata(t *testing.T, name, sql string, metadata map[string][]string, expected map[string][]string) {
+	t.Helper()
+	actual, err := LineageSourceColumns(
+		sql,
+		WithLineageDialect("trino"),
+		WithLineageMetadata(metadata),
+	)
+	if err != nil {
+		t.Fatalf("%s: LineageSourceColumns: %v", name, err)
+	}
+	want := map[string][]string{}
+	for table, cols := range expected {
+		c := append([]string{}, cols...)
+		sort.Strings(c)
+		want[table] = c
+	}
+	if !reflect.DeepEqual(actual, want) {
+		t.Fatalf("%s\nexpected: %v\nactual:   %v", name, want, actual)
+	}
+}
+
+// TestLineageEmptySourceMetadataIgnoresUnrelatedCatalogTables asserts that
+// metadata entries for tables not referenced by the query must not appear in the
+// lineage result, even when the queried table has an empty column list.
+func TestLineageEmptySourceMetadataIgnoresUnrelatedCatalogTables(t *testing.T) {
+	metadata := map[string][]string{
+		"foo":         {},
+		"other_table": {"a", "b", "c"},
+	}
+	assertLineageWithMetadata(t,
+		"empty_source_metadata_ignores_unrelated_catalog",
+		"SELECT a, b FROM foo",
+		metadata,
+		map[string][]string{
+			"foo": {"a", "b"},
+		},
+	)
+}
+
+// TestLineageEmptySourceMetadataCreditsOnlyQueriedTable is a focused regression
+// for the production case where a wide catalog is supplied but only one table is
+// read and its schema is unknown (empty metadata).
+func TestLineageEmptySourceMetadataCreditsOnlyQueriedTable(t *testing.T) {
+	metadata := map[string][]string{
+		"vdm_rda.launch_to_engage.event":            {},
+		"vdm_rda.launch_to_engage.event_attendance":  {"actual_end_time", "brand", "bu"},
+		"vdm_rda_launch_to_engage.event1":           {"brand", "actual_a_hcp_count", "event_nm"},
+	}
+	assertLineageWithMetadata(t,
+		"empty_event_metadata_credits_only_queried_table",
+		`SELECT brand, actual_end_time, actual_a_hcp_count, event_osmp_cd
+		 FROM vdm_rda.launch_to_engage.event`,
+		metadata,
+		map[string][]string{
+			"vdm_rda.launch_to_engage.event": {
+				"actual_a_hcp_count",
+				"actual_end_time",
+				"brand",
+				"event_osmp_cd",
+			},
+		},
+	)
+}
+
+// TestLineageResultKeysAreQuerySourceTablesOnly is a structural invariant: every
+// table key in the lineage result must be a base table the query actually reads.
+func TestLineageResultKeysAreQuerySourceTablesOnly(t *testing.T) {
+	metadata := map[string][]string{
+		"hive.raw.users":  {"user_id", "user_name"},
+		"hive.raw.orders": {"order_id", "user_id", "amount"},
+		"hive.raw.payments": {"order_id", "paid_amount"},
+	}
+	sql := `SELECT user_id, amount FROM hive.raw.orders`
+	got, err := LineageSourceColumns(sql,
+		WithLineageDialect("trino"), WithLineageMetadata(metadata))
+	if err != nil {
+		t.Fatalf("LineageSourceColumns: %v", err)
+	}
+	for table := range got {
+		if table != "hive.raw.orders" {
+			t.Fatalf("unexpected table %q in lineage; want only hive.raw.orders (got %v)", table, got)
+		}
+	}
+}

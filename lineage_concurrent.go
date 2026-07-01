@@ -73,6 +73,9 @@ func LineageSourceColumnsConcurrent(sql string, opts ...LineageOption) (map[stri
 				return
 			}
 			local := map[string]map[string]struct{}{}
+			for table := range req.tableCols {
+				ensureSet(local, table)
+			}
 			if aerr := aggregateColumns(client, leafSQL, req.cfg, req.schema, local); aerr != nil {
 				errs[i] = aerr
 				return

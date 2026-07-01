@@ -12,8 +12,8 @@
 //     appearing only in filter positions (WHERE / JOIN ... ON / GROUP BY /
 //     ORDER BY / ...) are excluded.
 //   - Wildcards (SELECT *, t.*) are expanded against the supplied metadata, and
-//     an ambiguous unqualified column is attributed to every candidate source
-//     table.
+//     an ambiguous unqualified column is attributed to every in-scope candidate
+//     source table. Metadata for tables not referenced by the query is ignored.
 //   - Source tables are resolved to their root physical tables (CTEs,
 //     subqueries and set operations are seen through), and every source table
 //     is listed even if no column flows from it.
@@ -90,10 +90,11 @@ func WithLineageNamespace(namespace string) LineageOption {
 }
 
 // WithLineageMetadata supplies table metadata used to expand wildcards
-// (SELECT *, t.*) and to resolve ambiguous unqualified columns. Keys are
-// fully-qualified table names ("catalog.schema.table" or "schema.table") and
-// values are their column lists. It corresponds to the Python `metadata`
-// argument backed by DummyMetaDataProvider.
+// (SELECT *, t.*) and to resolve ambiguous unqualified columns among the query's
+// source tables. Keys are fully-qualified table names ("catalog.schema.table" or
+// "schema.table") and values are their column lists. Catalog entries for tables
+// not referenced by the query are ignored. It corresponds to the Python
+// `metadata` argument backed by DummyMetaDataProvider.
 func WithLineageMetadata(metadata map[string][]string) LineageOption {
 	return func(o *lineageOptions) { o.metadata = metadata }
 }
@@ -200,8 +201,6 @@ func prepareLineage(client *polyglot.Client, sql string, opts ...LineageOption) 
 		return nil, err
 	}
 
-	schema := metadataToSchema(cfg.metadata)
-
 	// Seed every root physical source table with an empty set so a table that
 	// contributes no flowing column still appears in the result.
 	sources, err := sourceTables(client, innerSQL, cfg.dialect)
@@ -212,6 +211,8 @@ func prepareLineage(client *polyglot.Client, sql string, opts ...LineageOption) 
 	for _, name := range sources {
 		ensureSet(tableCols, name)
 	}
+
+	schema := metadataToSchema(metadataForSources(cfg.metadata, sources))
 
 	return &lineageRequest{
 		cfg:       cfg,
@@ -248,28 +249,139 @@ func aggregateColumns(
 
 	// Fold each output field into tableCols in a single pass:
 	//   - Resolved fields map to the source (table, column) pairs that produced
-	//     them.
+	//     them, but only when the input table is in the query scope.
 	//   - Unresolved fields are usually a bare column that is ambiguous across
-	//     joined tables. sqllineage attributes such a column to every candidate
-	//     source table, so do the same: treat the output field name as the
-	//     column name and credit each source table that declares it in metadata.
+	//     joined tables. sqllineage attributes such a column to every in-scope
+	//     candidate source table that declares it in metadata; when no in-scope
+	//     metadata declares it, every source table in scope is credited.
+	scopeTables := scopeTableNames(tableCols)
 	for name, field := range res.Facet.Fields {
 		if len(field.InputFields) == 0 {
-			for _, in := range res.Inputs {
-				if in.Name != "" && containsString(cfg.metadata[in.Name], name) {
-					ensureSet(tableCols, in.Name)[name] = struct{}{}
-				}
-			}
+			creditUnresolvedColumn(name, cfg.metadata, scopeTables, tableCols)
 			continue
 		}
 		for _, in := range field.InputFields {
 			if in.Name == "" || in.Field == "" {
 				continue
 			}
-			ensureSet(tableCols, in.Name)[in.Field] = struct{}{}
+			scope, ok := resolveScopeTable(tableCols, in.Name)
+			if !ok {
+				continue
+			}
+			ensureSet(tableCols, scope)[in.Field] = struct{}{}
 		}
 	}
 	return nil
+}
+
+func scopeTableNames(tableCols map[string]map[string]struct{}) []string {
+	names := make([]string, 0, len(tableCols))
+	for t := range tableCols {
+		names = append(names, t)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func creditUnresolvedColumn(
+	name string,
+	metadata map[string][]string,
+	scopeTables []string,
+	tableCols map[string]map[string]struct{},
+) {
+	var credited bool
+	for _, scope := range scopeTables {
+		if cols, ok := lookupMetadataColumns(metadata, scope); ok && containsString(cols, name) {
+			ensureSet(tableCols, scope)[name] = struct{}{}
+			credited = true
+		}
+	}
+	if credited {
+		return
+	}
+	for _, scope := range scopeTables {
+		ensureSet(tableCols, scope)[name] = struct{}{}
+	}
+}
+
+// resolveScopeTable maps an OpenLineage input dataset name to the fully-qualified
+// scope table key seeded from the query's base tables.
+func resolveScopeTable(tableCols map[string]map[string]struct{}, inputName string) (string, bool) {
+	if _, ok := tableCols[inputName]; ok {
+		return inputName, true
+	}
+	var matches []string
+	for scope := range tableCols {
+		if tableRefMatches(inputName, scope) {
+			matches = append(matches, scope)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], true
+	}
+	return "", false
+}
+
+func tableRefMatches(a, b string) bool {
+	if a == b {
+		return true
+	}
+	for _, pair := range [][2]string{{a, b}, {b, a}} {
+		ref, qualified := pair[0], pair[1]
+		suffix := ref
+		if !strings.Contains(ref, ".") {
+			suffix = "." + ref
+		}
+		if strings.HasSuffix(qualified, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// metadataForSources returns the subset of metadata for tables the query reads.
+// Catalog entries for unrelated tables are excluded so they cannot influence
+// OpenLineage resolution or the unresolved-column heuristic.
+func metadataForSources(metadata map[string][]string, sources []string) map[string][]string {
+	if len(metadata) == 0 || len(sources) == 0 {
+		return metadata
+	}
+	out := make(map[string][]string, len(sources))
+	for _, src := range sources {
+		key := metadataKeyForTable(metadata, src)
+		if cols, ok := metadata[key]; ok {
+			out[key] = append([]string{}, cols...)
+			continue
+		}
+		if cols, ok := lookupMetadataColumns(metadata, src); ok {
+			out[key] = cols
+			continue
+		}
+		out[src] = []string{}
+	}
+	return out
+}
+
+func metadataKeyForTable(metadata map[string][]string, tableRef string) string {
+	if _, ok := metadata[tableRef]; ok {
+		return tableRef
+	}
+	suffix := tableRef
+	if !strings.Contains(tableRef, ".") {
+		suffix = "." + tableRef
+	}
+	var found string
+	var count int
+	for key := range metadata {
+		if key == tableRef || strings.HasSuffix(key, suffix) {
+			found = key
+			count++
+		}
+	}
+	if count == 1 {
+		return found
+	}
+	return tableRef
 }
 
 // sourceTables returns the fully-qualified root physical tables that querySQL
