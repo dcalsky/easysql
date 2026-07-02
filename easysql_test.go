@@ -268,17 +268,36 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
+// TestSelfCheck pins the documented contract of WithSelfCheck: it is a no-op
+// (validity is always enforced), so toggling it must neither break the rewrite
+// nor change its output. A bare "no error" check would still pass if the option
+// silently disabled wrapping or if the rewrite regressed to returning the input
+// unchanged; asserting the exact wrap count and byte-identical on/off output
+// rules both out.
 func TestSelfCheck(t *testing.T) {
-	// With self-check on, a valid rewrite still succeeds.
-	for _, sql := range []string{
-		"select * from a",
-		"select a.id from a join b on a.id = b.id",
-		"select * from a union select * from b",
-		"with c as (select * from a) select * from c",
-	} {
-		if _, err := ApplyRowFilter(sql, testWhere, WithSelfCheck(true)); err != nil {
-			t.Fatalf("self-check rewrite %q: %v", sql, err)
-		}
+	cases := []struct {
+		sql       string
+		wantWraps int
+	}{
+		{"select * from a", 1},
+		{"select a.id from a join b on a.id = b.id", 2},
+		{"select * from a union select * from b", 2},
+		{"with c as (select * from a) select * from c", 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			// With self-check on: a valid rewrite that wraps exactly the
+			// expected tables (rewriteValid re-parses and counts the marker).
+			withCheck := rewriteValid(t, "mysql", tc.sql, testWhere, testMarker, tc.wantWraps, WithSelfCheck(true))
+			// Since the option is a no-op, the output must match the default.
+			without, err := ApplyRowFilter(tc.sql, testWhere, WithDialect("mysql"))
+			if err != nil {
+				t.Fatalf("default rewrite %q: %v", tc.sql, err)
+			}
+			if withCheck != without {
+				t.Fatalf("WithSelfCheck must be a no-op but changed output:\n on:  %s\n off: %s", withCheck, without)
+			}
+		})
 	}
 }
 
@@ -342,13 +361,18 @@ func TestDialectBoundary(t *testing.T) {
 
 	pass := 0
 	for _, tc := range cases {
-		t.Run(tc.dialect+"/"+tc.name, func(t *testing.T) {
+		// Count only subtests that actually passed. t.Run reports the subtest
+		// result; ignoring it made the coverage guard below dead code (pass
+		// always equalled len(cases)), so a real dialect regression could slip
+		// through as long as at least the panic/skip machinery kept running.
+		if t.Run(tc.dialect+"/"+tc.name, func(t *testing.T) {
 			rewriteValid(t, tc.dialect, tc.sql, testWhere, testMarker, tc.wantWraps)
-		})
-		pass++
+		}) {
+			pass++
+		}
 	}
 	if pass != len(cases) {
 		t.Fatalf("coverage regressed: %d/%d", pass, len(cases))
 	}
-	t.Logf("dialect coverage: %d/%d parsed+rewritten+validated", len(cases), len(cases))
+	t.Logf("dialect coverage: %d/%d parsed+rewritten+validated", pass, len(cases))
 }

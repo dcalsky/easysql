@@ -61,9 +61,20 @@ func benchCases() []struct {
 	return cases
 }
 
+// singleSelectLineage is the exact lineage of unionLeafTemplates[0] (verified
+// against the serial analyzer): filter-only columns (JOIN ON user_id, WHERE
+// status/email) are excluded, only the projected columns flow through. It
+// anchors the concurrent test so a shared bug that made BOTH drivers return the
+// same (e.g. empty) map cannot slip past a pure serial-vs-concurrent equality.
+var singleSelectLineage = map[string][]string{
+	"hive.raw.users":  {"user_name"},
+	"hive.raw.orders": {"amount", "quantity"},
+}
+
 // TestLineageSourceColumnsConcurrentMatchesSerial asserts the concurrent driver
 // is a faithful drop-in: for every workload it returns exactly what the serial
-// baseline returns.
+// baseline returns. It also anchors the serial baseline itself so the equality
+// is not satisfied vacuously by two identically-broken (e.g. empty) results.
 func TestLineageSourceColumnsConcurrentMatchesSerial(t *testing.T) {
 	for _, tc := range benchCases() {
 		t.Run(tc.name, func(t *testing.T) {
@@ -79,6 +90,14 @@ func TestLineageSourceColumnsConcurrentMatchesSerial(t *testing.T) {
 			}
 			if !reflect.DeepEqual(serial, concurrent) {
 				t.Fatalf("concurrent != serial\n serial:     %v\n concurrent: %v", serial, concurrent)
+			}
+			// Anchor: every leaf template reads the three trinoMetadata tables,
+			// so a merged lineage that came back empty is a bug, not a pass.
+			if len(serial) == 0 {
+				t.Fatalf("%s: lineage unexpectedly empty (serial and concurrent both broken?)", tc.name)
+			}
+			if tc.name == "single_select" && !reflect.DeepEqual(serial, singleSelectLineage) {
+				t.Fatalf("single_select lineage drifted:\n got:  %v\n want: %v", serial, singleSelectLineage)
 			}
 		})
 	}
