@@ -696,6 +696,16 @@ func TestReferencedColumnsSupersetInvariant(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReferencedColumns(%q): %v", sql, err)
 		}
+		// Every corpus query reads at least one physical table. Without these
+		// guards the superset loop below would pass vacuously if either analyzer
+		// regressed to returning an empty map (the loop body simply never runs),
+		// so a totally broken lineage/referenced pass would look green.
+		if len(lineage) == 0 {
+			t.Fatalf("%q: LineageSourceColumns returned no source tables", sql)
+		}
+		if len(referenced) == 0 {
+			t.Fatalf("%q: ReferencedColumns returned no source tables", sql)
+		}
 		for tbl, cols := range lineage {
 			refCols, ok := referenced[tbl]
 			if !ok {

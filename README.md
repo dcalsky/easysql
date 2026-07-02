@@ -102,6 +102,14 @@ binding and escaping any values inside it.
 
 ### LineageSourceColumns
 
+> **Column-level data lineage** traces where a query's output *data comes from*:
+> for each column in the result, which source-table columns' **values flow into
+> it**. It answers "which columns produce this result", not "which columns does
+> this query mention". A column used only to decide *which rows* appear (a
+> `WHERE`/`JOIN ON`/`GROUP BY` predicate) contributes no value to any output
+> column, so it is **not** part of the lineage. (For the "every column the
+> statement touches" question, see [`ReferencedColumns`](#referencedcolumns).)
+
 Returns, for each root physical source table, the sorted list of **source columns
 that reach the query result**. Columns used only in filters (`WHERE`, `JOIN … ON`,
 `GROUP BY`, `ORDER BY`, …) are excluded. Semantics align with sqllineage's
