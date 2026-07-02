@@ -1,10 +1,10 @@
 module github.com/dcalsky/easysql
 
-go 1.25
+go 1.25.0
 
 require (
 	github.com/bytedance/sonic v1.15.2
-	github.com/tobilg/polyglot/packages/go v0.5.10
+	github.com/tobilg/polyglot/packages/go v0.5.12
 )
 
 require (
