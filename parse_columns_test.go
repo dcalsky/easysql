@@ -496,3 +496,325 @@ func TestParseColumnsDropReturnsNil(t *testing.T) {
 		t.Fatalf("got %v; want nil", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Audit probes for ParseColumns. Each test asserts behavior documented in
+// README.md ("ParseColumns" section) and the ParseColumns doc comment:
+//   - names are returned in left-to-right projection order
+//   - unaliased expressions become _col{index} (Trino convention)
+//   - * / t.* expand via WithLineageMetadata; absent table -> ["*"];
+//     present-with-[] -> []
+//   - multi-table SELECT * requires every base table in metadata, else ["*"]
+//   - CREATE TABLE ... (LIKE t) requires metadata
+//   - INSERT ... VALUES without column list -> ErrUnsupported
+//   - explicit column lists on CREATE VIEW / CREATE TABLE / INSERT override
+//     SELECT-inferred names
+// ---------------------------------------------------------------------------
+
+var bughuntPCMeta = map[string][]string{
+	"hive.raw.users":  {"id", "name", "email"},
+	"hive.raw.orders": {"oid", "uid", "amt"},
+}
+
+func bughuntPCRun(t *testing.T, sql string, opts ...LineageOption) []string {
+	t.Helper()
+	opts = append([]LineageOption{WithLineageDialect("trino")}, opts...)
+	got, err := ParseColumns(sql, opts...)
+	if err != nil {
+		t.Fatalf("ParseColumns(%q): %v", sql, err)
+	}
+	return got
+}
+
+func bughuntPCWant(t *testing.T, sql string, want []string, opts ...LineageOption) {
+	t.Helper()
+	got := bughuntPCRun(t, sql, opts...)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ParseColumns(%q)\n got: %v\nwant: %v", sql, got, want)
+	}
+}
+
+// Explicit projections must come back in projection order even when metadata
+// is supplied and lists the table's columns in a different order.
+func TestBughuntExplicitProjectionOrderWithMetadata(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT email, id FROM hive.raw.users",
+		[]string{"email", "id"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+// Same, but the projection interleaves two metadata tables.
+func TestBughuntExplicitProjectionOrderTwoTables(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT o.amt, u.name, o.oid FROM hive.raw.users u JOIN hive.raw.orders o ON u.id = o.uid",
+		[]string{"amt", "name", "oid"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+// t.* mixed with explicit columns, star NOT first.
+func TestBughuntExplicitThenQualifiedStar(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT o.amt, u.* FROM hive.raw.users u JOIN hive.raw.orders o ON u.id = o.uid",
+		[]string{"amt", "id", "name", "email"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+// Two qualified stars; SELECT-list table order preserved.
+func TestBughuntTwoQualifiedStarsOrderPreserved(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT o.*, u.* FROM hive.raw.users u JOIN hive.raw.orders o ON u.id = o.uid",
+		[]string{"oid", "uid", "amt", "id", "name", "email"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+func TestBughuntDuplicateColumnNames(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT id, id FROM hive.raw.users",
+		[]string{"id", "id"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+func TestBughuntDuplicateAliases(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT a AS x, b AS x FROM t",
+		[]string{"x", "x"},
+	)
+}
+
+// An unaliased expression at position 0 must be _col0 and must not steal the
+// following column's name.
+func TestBughuntColIndexPositionZero(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT count(*), a, sum(b) FROM t GROUP BY 2",
+		[]string{"_col0", "a", "_col2"},
+	)
+}
+
+// Unaliased expression at a non-zero position without metadata.
+func TestBughuntColIndexPositionOne(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT a, count(*) FROM t GROUP BY 1",
+		[]string{"a", "_col1"},
+	)
+}
+
+// Unaliased expression after an expanded star: the documented format is
+// _col{index} (no engine-internal second underscore).
+func TestBughuntColIndexAfterStarFormat(t *testing.T) {
+	got := bughuntPCRun(t,
+		"SELECT u.*, u.id + 1 FROM hive.raw.users u",
+		WithLineageMetadata(bughuntPCMeta),
+	)
+	if len(got) != 4 || (got[3] != "_col1" && got[3] != "_col3") {
+		t.Errorf("got %v; want [id name email _col1|_col3]", got)
+	}
+}
+
+func TestBughuntQuotedMixedCaseAlias(t *testing.T) {
+	bughuntPCWant(t,
+		`SELECT a AS "MiXeD Case", b AS "with""quote" FROM t`,
+		[]string{"MiXeD Case", `with"quote`},
+	)
+}
+
+func TestBughuntMySQLBacktickAlias(t *testing.T) {
+	got, err := ParseColumns(
+		"SELECT a AS `My Col`, b FROM t",
+		WithLineageDialect("mysql"),
+	)
+	if err != nil {
+		t.Fatalf("ParseColumns: %v", err)
+	}
+	want := []string{"My Col", "b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+// SELECT * over a derived table whose inner select renames columns.
+func TestBughuntStarOverSubqueryWithRenames(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT * FROM (SELECT id AS x, name AS y FROM hive.raw.users) s",
+		[]string{"x", "y"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+// SELECT * over a CTE that projects a subset in a different order than the
+// base table; the CTE's own projection order must win, not metadata order.
+func TestBughuntStarOverCTESubsetReordered(t *testing.T) {
+	bughuntPCWant(t,
+		"WITH c AS (SELECT email, id FROM hive.raw.users) SELECT * FROM c",
+		[]string{"email", "id"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+// Names come from the leftmost branch.
+func TestBughuntUnionLeftmostWins(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT a AS l1, b AS l2 FROM t UNION ALL SELECT c, d FROM r",
+		[]string{"l1", "l2"},
+	)
+}
+
+// UNION with * on the left branch and metadata for both tables: the expansion
+// of hive.raw.users must come back in the table's column order.
+func TestBughuntUnionStarLeftBranch(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT * FROM hive.raw.users UNION ALL SELECT oid, uid, amt FROM hive.raw.orders",
+		[]string{"id", "name", "email"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+// UNION with * on the right branch only; left branch names win.
+func TestBughuntUnionStarRightBranch(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT id, name, email FROM hive.raw.users UNION ALL SELECT * FROM hive.raw.orders",
+		[]string{"id", "name", "email"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+// Explicit view column list overrides SELECT names even on count mismatch.
+func TestBughuntCreateViewColumnListCountMismatch(t *testing.T) {
+	bughuntPCWant(t,
+		"CREATE VIEW c.s.v (x1, x2) AS SELECT a, b, c FROM t",
+		[]string{"x1", "x2"},
+	)
+}
+
+// PRIMARY KEY / KEY constraint entries must not leak into columns.
+func TestBughuntCreateTableConstraintsNotColumns(t *testing.T) {
+	got, err := ParseColumns(
+		"CREATE TABLE t (id BIGINT, name VARCHAR(10), PRIMARY KEY (id), KEY idx_name (name))",
+		WithLineageDialect("mysql"),
+	)
+	if err != nil {
+		t.Fatalf("ParseColumns: %v", err)
+	}
+	want := []string{"id", "name"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+// CREATE TABLE LIKE where the metadata entry is an explicit empty list: the
+// result should be a non-nil empty slice (the table is known to expose zero
+// columns), not nil (which means "not a column-producing statement").
+func TestBughuntCreateTableLikeEmptyMetadataEntry(t *testing.T) {
+	got := bughuntPCRun(t,
+		"CREATE TABLE c.s.t (LIKE c.s.other)",
+		WithLineageMetadata(map[string][]string{"c.s.other": {}}),
+	)
+	if got == nil || len(got) != 0 {
+		t.Errorf("got %#v; want empty non-nil slice", got)
+	}
+}
+
+// LIKE with a suffix-ambiguous metadata key must not silently pick one.
+func TestBughuntCreateTableLikeAmbiguousSuffix(t *testing.T) {
+	_, err := ParseColumns(
+		"CREATE TABLE c.s.t (LIKE other)",
+		WithLineageDialect("trino"),
+		WithLineageMetadata(map[string][]string{
+			"a.b.other": {"a1"},
+			"x.y.other": {"x1"},
+		}),
+	)
+	if err == nil {
+		t.Errorf("expected error for ambiguous LIKE source, got nil")
+	} else if !errors.Is(err, ErrUnsupported) {
+		t.Errorf("expected ErrUnsupported, got %v", err)
+	}
+}
+
+func TestBughuntInsertColumnListOverridesSelectStar(t *testing.T) {
+	bughuntPCWant(t,
+		"INSERT INTO c.s.t (c1, c2, c3) SELECT * FROM hive.raw.users",
+		[]string{"c1", "c2", "c3"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+func TestBughuntInsertDefaultValuesWithoutColumnList(t *testing.T) {
+	_, err := ParseColumns("INSERT INTO c.s.t DEFAULT VALUES", WithLineageDialect("postgresql"))
+	if err == nil {
+		t.Errorf("expected ErrUnsupported for INSERT DEFAULT VALUES without column list, got nil")
+	} else if !errors.Is(err, ErrUnsupported) {
+		t.Errorf("expected ErrUnsupported, got %v", err)
+	}
+}
+
+// count(*) is a function argument, not a star projection.
+func TestBughuntCountStarNotAStarProjection(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT count(*) FROM hive.raw.users",
+		[]string{"_col0"},
+	)
+	bughuntPCWant(t,
+		"SELECT count(*) AS n FROM hive.raw.users",
+		[]string{"n"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+// a.b where a is a table alias: exposed name is the column name.
+func TestBughuntQualifiedColumnName(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT u.id FROM hive.raw.users u",
+		[]string{"id"},
+		WithLineageMetadata(bughuntPCMeta),
+	)
+}
+
+// Row-field access t.c.f (trino): accept the trailing field name or the
+// documented _col0 fallback.
+func TestBughuntRowFieldAccess(t *testing.T) {
+	got := bughuntPCRun(t, "SELECT t.c.f FROM c.s.t t")
+	if len(got) != 1 {
+		t.Fatalf("got %v; want single column", got)
+	}
+	if got[0] != "f" && got[0] != "_col0" {
+		t.Errorf("got %v; want [f] or [_col0]", got)
+	}
+}
+
+// WITH RECURSIVE (postgresql) — names from the final select.
+func TestBughuntWithRecursive(t *testing.T) {
+	got, err := ParseColumns(
+		"WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 3) SELECT n AS depth FROM r",
+		WithLineageDialect("postgresql"),
+	)
+	if err != nil {
+		t.Fatalf("ParseColumns: %v", err)
+	}
+	want := []string{"depth"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+// Empty metadata map behaves like no metadata.
+func TestBughuntEmptyMetadataMap(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT * FROM hive.raw.users",
+		[]string{"*"},
+		WithLineageMetadata(map[string][]string{}),
+	)
+}
+
+// Metadata present for an unrelated table only.
+func TestBughuntMetadataUnrelatedTable(t *testing.T) {
+	bughuntPCWant(t,
+		"SELECT * FROM hive.raw.users",
+		[]string{"*"},
+		WithLineageMetadata(map[string][]string{"hive.raw.orders": {"oid"}}),
+	)
+}

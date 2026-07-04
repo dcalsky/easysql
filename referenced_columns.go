@@ -99,7 +99,8 @@ type cteNode struct {
 }
 
 type withClause struct {
-	CTEs []*cteNode `json:"ctes"`
+	Recursive bool       `json:"recursive"`
+	CTEs      []*cteNode `json:"ctes"`
 }
 
 type fromClause struct {
@@ -235,9 +236,7 @@ func referencedColumns(client *polyglot.Client, sql string, opts ...LineageOptio
 	for _, o := range opts {
 		o(&cfg)
 	}
-	if strings.TrimSpace(cfg.dialect) == "" {
-		cfg.dialect = "trino"
-	}
+	cfg.dialect = normalizeLineageDialect(cfg.dialect)
 
 	stmt, err := parseFirstStatement(client, sql, cfg.dialect)
 	if err != nil {
@@ -341,9 +340,23 @@ type scopeCtx struct {
 type refResolver struct {
 	metadata map[string][]string
 	result   map[string]map[string]struct{}
+
+	// flowOnly switches the resolver from "columns touched anywhere"
+	// (ReferencedColumns) to "columns whose values flow into the result"
+	// (LineageSourceColumns): filter positions are skipped and column refs are
+	// NOT recorded eagerly — instead the caller records only the refs of the
+	// query's final output names (so an intermediate CTE/derived column that no
+	// downstream projection selects is correctly dropped).
+	flowOnly bool
 }
 
 func (rr *refResolver) add(table, col string) {
+	if rr.flowOnly {
+		// In flow mode nothing is recorded eagerly; the caller records the
+		// final output refs. Column refs still propagate through the returned
+		// resolvedOut mappings.
+		return
+	}
 	if table == "" || col == "" {
 		return
 	}
@@ -377,30 +390,71 @@ func (rr *refResolver) resolveQuery(q *queryNode, parent *scopeCtx) *resolvedOut
 }
 
 // newScope builds a scope whose visible CTEs come from with plus the parent.
+//
+// CTE visibility follows SQL scoping. Every CTE declared by `with` is visible
+// to the query body that follows (the returned scope's ctes). But each CTE
+// *definition body* sees a restricted set: the enclosing scope's CTEs plus,
+//   - for a non-recursive WITH, only the EARLIER siblings (a CTE cannot see
+//     itself or a later sibling, so a same-named FROM entry inside it is the
+//     physical table of that name), or
+//   - for a WITH RECURSIVE, all siblings of this WITH (self- and mutual
+//     references denote the CTE).
 func (rr *refResolver) newScope(with *withClause, parent *scopeCtx) *scopeCtx {
-	ctes := map[string]*cteEntry{}
+	base := map[string]*cteEntry{}
 	if parent != nil {
 		for k, v := range parent.ctes {
-			ctes[k] = v
+			base[k] = v
 		}
 	}
+
+	// all: what the query body following this WITH can see (every sibling).
+	all := map[string]*cteEntry{}
+	for k, v := range base {
+		all[k] = v
+	}
+
 	if with != nil {
+		// Materialize the sibling entries first so recursive bodies can see all
+		// of them (including later siblings) before their scopes are assigned.
+		type named struct {
+			name string
+			e    *cteEntry
+		}
+		var ordered []named
 		for _, c := range with.CTEs {
 			name := strings.ToLower(c.Alias.text())
 			if name == "" {
 				continue
 			}
-			ctes[name] = &cteEntry{node: c.This, colAlias: identNames(c.Columns)}
+			e := &cteEntry{node: c.This, colAlias: identNames(c.Columns)}
+			all[name] = e
+			ordered = append(ordered, named{name, e})
+		}
+
+		// Assign each new sibling's definition-body scope with the correct
+		// visibility. Entries inherited from the parent keep their own parent
+		// scope (do not re-point them).
+		visible := map[string]*cteEntry{}
+		for k, v := range base {
+			visible[k] = v
+		}
+		for _, ne := range ordered {
+			bodyCtes := map[string]*cteEntry{}
+			if with.Recursive {
+				for k, v := range all {
+					bodyCtes[k] = v
+				}
+			} else {
+				for k, v := range visible {
+					bodyCtes[k] = v
+				}
+			}
+			ne.e.parent = &scopeCtx{byAlias: map[string]*source{}, ctes: bodyCtes, parent: parent}
+			visible[ne.name] = ne.e
 		}
 	}
-	ctx := &scopeCtx{byAlias: map[string]*source{}, ctes: ctes, parent: parent}
-	// CTE bodies resolve under this scope (so they see sibling/outer CTEs).
-	for _, e := range ctes {
-		if e.parent == nil {
-			e.parent = ctx
-		}
-	}
-	return ctx
+
+	return &scopeCtx{byAlias: map[string]*source{}, ctes: all, parent: parent}
 }
 
 // resolveSelect resolves a single SELECT scope.
@@ -410,12 +464,20 @@ func (rr *refResolver) resolveSelect(sel *selectBody, parent *scopeCtx) *resolve
 
 	// FROM-position wrappers (PIVOT/UNNEST/table functions) collected once all
 	// sources — and thus all aliases — are known.
-	for _, d := range ctx.deferred {
-		rr.collect(d, ctx)
+	if !rr.flowOnly {
+		for _, d := range ctx.deferred {
+			rr.collect(d, ctx)
+		}
 	}
 
 	// Projection: build the output mapping and record projection refs.
 	out := rr.buildOut(sel.Expressions, ctx)
+
+	// Flow mode reports only columns that reach the result: filter, grouping,
+	// join-ON and USING positions do not flow, so stop after the projection.
+	if rr.flowOnly {
+		return out
+	}
 
 	// Filter and grouping positions: record refs only.
 	for _, e := range []expr{
@@ -637,8 +699,14 @@ func (rr *refResolver) buildOut(expressions []expr, ctx *scopeCtx) *resolvedOut 
 			out.add(col, rr.collectRefs(item, ctx))
 		default:
 			// Unaliased expression: still record its referenced columns; its
-			// output name is engine-defined (_colN) and not tracked here.
-			rr.collectRefs(item, ctx)
+			// output name is engine-defined (_colN) and not tracked here. In
+			// flow mode the refs must still propagate to the caller (e.g. a
+			// scalar subquery whose single value is an unaliased aggregate), so
+			// attach them to the output under an empty name.
+			refs := rr.collectRefs(item, ctx)
+			if rr.flowOnly {
+				out.add("", refs)
+			}
 		}
 	}
 	return out
@@ -669,8 +737,24 @@ func (rr *refResolver) expandStar(star *starNode, ctx *scopeCtx) []namedRefs {
 		}
 	}
 	if qualifier != "" {
-		if s := ctx.byAlias[qualifier]; s != nil {
-			emit(s)
+		// Resolve the qualifier against the current scope first, then enclosing
+		// scopes (a correlated star such as `t.*` inside a subquery where `t` is
+		// only visible in the outer query).
+		for c := ctx; c != nil; c = c.parent {
+			if s := c.byAlias[qualifier]; s != nil {
+				emit(s)
+				return out
+			}
+		}
+		// Unknown qualifier: never drop. Fail open by broadcasting the "*"
+		// sentinel onto every physical root in scope and enclosing scopes.
+		roots := chainRoots(ctx)
+		if len(roots) == 0 {
+			roots = []string{qualifier}
+		}
+		for _, r := range roots {
+			rr.add(r, "*")
+			out = append(out, namedRefs{name: "*", refs: []colRef{{r, "*"}}})
 		}
 		return out
 	}
@@ -718,7 +802,15 @@ func (rr *refResolver) collectRefs(e expr, ctx *scopeCtx) []colRef {
 		if obj, ok := decodeObj(n); ok {
 			switch {
 			case isQueryObj(obj):
-				rr.resolveQuery(mustQuery(n), ctx)
+				sub := rr.resolveQuery(mustQuery(n), ctx)
+				// A scalar subquery in an expression position contributes its
+				// output value(s) to the enclosing projection, so in flow mode
+				// its resolved refs must flow up into this projection's refs.
+				if rr.flowOnly {
+					for _, name := range sub.names {
+						acc = append(acc, sub.byName[strings.ToLower(name)]...)
+					}
+				}
 			case has(obj, "column"):
 				acc = append(acc, rr.recordColumn(obj["column"], ctx)...)
 			case has(obj, "dot"):
@@ -975,9 +1067,26 @@ func (rr *refResolver) resolveUpdate(upd *updateNode) {
 	// SET pairs: [targetColumnIdentifier, valueExpression].
 	for _, pair := range upd.Set {
 		if len(pair) >= 1 {
-			var id ident
-			if decodeInto(pair[0], &id) == nil && id.Name != "" {
-				rr.add(targetRoot, id.Name)
+			// A target may be a bare column (`SET x = …`) or table-qualified
+			// (`SET t.x = …`); resolve to the bare column name and attribute it to
+			// the qualified table, falling back to the UPDATE target.
+			col, qualifier := dotColumn(pair[0])
+			if col == "" {
+				// Some dialects (e.g. MySQL) store a qualified target as a single
+				// ident whose name is the dotted path "t.x".
+				var id ident
+				if decodeInto(pair[0], &id) == nil && id.Name != "" {
+					col, qualifier = splitQualifiedName(id.Name)
+				}
+			}
+			if col != "" {
+				if qualifier != "" {
+					for _, ref := range rr.resolveQualified(strings.ToLower(qualifier), col, ctx) {
+						rr.add(ref.table, ref.col)
+					}
+				} else {
+					rr.add(targetRoot, col)
+				}
 			}
 		}
 		for i := 1; i < len(pair); i++ {
@@ -1093,6 +1202,15 @@ func isQueryObj(obj map[string]expr) bool {
 // catalog.schema.table.column. The outermost field is the column; every segment
 // before it is the qualifier so fully-qualified references can disambiguate
 // tables with the same bare name. node is the {"dot": …} wrapper.
+// splitQualifiedName splits a dotted name into its final segment (column) and
+// the preceding qualifier, e.g. "t.x" -> ("x", "t") and "x" -> ("x", "").
+func splitQualifiedName(name string) (col, qualifier string) {
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		return name[i+1:], name[:i]
+	}
+	return name, ""
+}
+
 func dotColumn(node expr) (col, qualifier string) {
 	segs := dotSegments(node)
 	if len(segs) == 0 {

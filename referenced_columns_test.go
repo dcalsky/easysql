@@ -2,7 +2,9 @@ package easysql
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
+	"regexp"
 	"sort"
 	"testing"
 )
@@ -743,5 +745,354 @@ func TestReferencedColumnsSupersetInvariant(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Audit probes for ReferencedColumns.
+// ---------------------------------------------------------------------------
+
+// rcHuntMeta is a small catalog for metadata-driven probes.
+var rcHuntMeta = map[string][]string{
+	"hive.raw.users":  {"id", "name", "email"},
+	"hive.raw.orders": {"oid", "uid", "amt", "status"},
+}
+
+func rcHuntRun(t *testing.T, sql string, opts ...LineageOption) map[string][]string {
+	t.Helper()
+	opts = append([]LineageOption{WithLineageDialect("trino")}, opts...)
+	got, err := ReferencedColumns(sql, opts...)
+	if err != nil {
+		t.Fatalf("ReferencedColumns(%q): %v", sql, err)
+	}
+	return got
+}
+
+func rcHuntWant(expected map[string][]string) map[string][]string {
+	want := map[string][]string{}
+	for tbl, cols := range expected {
+		c := append([]string{}, cols...)
+		sort.Strings(c)
+		want[tbl] = c
+	}
+	return want
+}
+
+// Property test: ReferencedColumns ⊇ LineageSourceColumns per table, over a
+// corpus of SELECT queries (documented: "returns a superset of
+// LineageSourceColumns's result"). Synthesized positional names (_0, _1, …)
+// must never be emitted as source columns by LineageSourceColumns.
+func TestBughuntSupersetProperty(t *testing.T) {
+	corpus := []string{
+		`SELECT id FROM hive.raw.users WHERE email IS NOT NULL`,
+		`SELECT u.name, o.amt FROM hive.raw.users u JOIN hive.raw.orders o ON u.id = o.uid`,
+		`SELECT name FROM hive.raw.users ORDER BY id`,
+		`SELECT status, sum(amt) FROM hive.raw.orders GROUP BY status HAVING count(oid) > 1`,
+		`WITH c AS (SELECT id, name FROM hive.raw.users WHERE email LIKE '%x') SELECT name FROM c WHERE id > 0`,
+		`SELECT * FROM hive.raw.orders WHERE status = 'PAID'`,
+		`SELECT id FROM hive.raw.users UNION ALL SELECT uid FROM hive.raw.orders`,
+		`SELECT s.n FROM (SELECT name AS n, id FROM hive.raw.users) s WHERE s.id > 1`,
+		`SELECT amt FROM hive.raw.orders o WHERE o.uid IN (SELECT id FROM hive.raw.users WHERE name = 'a')`,
+		`SELECT id, row_number() OVER (PARTITION BY name ORDER BY email) FROM hive.raw.users`,
+		`SELECT a.id FROM hive.raw.users a JOIN hive.raw.users b ON a.email = b.name`,
+	}
+	synthetic := regexp.MustCompile(`^_\d+$`)
+	var violations, syntheticViolations []string
+	for _, sql := range corpus {
+		lineage, err := LineageSourceColumns(sql, WithLineageDialect("trino"), WithLineageMetadata(rcHuntMeta))
+		if err != nil {
+			t.Fatalf("LineageSourceColumns(%q): %v", sql, err)
+		}
+		referenced, err := ReferencedColumns(sql, WithLineageDialect("trino"), WithLineageMetadata(rcHuntMeta))
+		if err != nil {
+			t.Fatalf("ReferencedColumns(%q): %v", sql, err)
+		}
+		for tbl, cols := range lineage {
+			refCols, ok := referenced[tbl]
+			if !ok {
+				violations = append(violations, fmt.Sprintf("%q: table %q in lineage but missing from referenced (%v)", sql, tbl, referenced))
+				continue
+			}
+			set := map[string]struct{}{}
+			for _, c := range refCols {
+				set[c] = struct{}{}
+			}
+			for _, c := range cols {
+				if _, ok := set[c]; !ok {
+					msg := fmt.Sprintf("%q: %s.%s in lineage but not in referenced %v", sql, tbl, c, refCols)
+					if synthetic.MatchString(c) {
+						syntheticViolations = append(syntheticViolations, msg)
+					} else {
+						violations = append(violations, msg)
+					}
+				}
+			}
+		}
+	}
+	for _, v := range violations {
+		t.Error(v)
+	}
+	for _, v := range syntheticViolations {
+		t.Errorf("superset invariant violated by a synthesized positional name (LineageSourceColumns must not emit _0/_1/… as source columns): %s", v)
+	}
+}
+
+// Self-referencing non-recursive CTE: in standard SQL (and Trino, without
+// RECURSIVE) the inner `t` in `WITH t AS (SELECT a FROM t)` is the PHYSICAL
+// table t — a non-recursive CTE cannot reference itself.
+func TestBughuntCTEShadowSelfReference(t *testing.T) {
+	got := rcHuntRun(t, `WITH t AS (SELECT a FROM t) SELECT a FROM t`)
+	want := rcHuntWant(map[string][]string{"t": {"a"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("self-referencing non-recursive CTE: inner FROM t is the physical table; got %v want %v", got, want)
+	}
+}
+
+// A CTE defined AFTER its use site: in standard SQL a CTE body may only see
+// earlier siblings, so `b` inside the first CTE is the physical table b.
+func TestBughuntCTEForwardSiblingReference(t *testing.T) {
+	got := rcHuntRun(t, `WITH a AS (SELECT x FROM b), b AS (SELECT y FROM t) SELECT x FROM a`)
+	// Physical table b must at least be present (fail-open: never drop a
+	// physical table appearing in a FROM). We only assert presence of key "b".
+	if _, ok := got["b"]; !ok {
+		t.Errorf("forward-sibling CTE reference must resolve to the physical table b (present in result); got %v", got)
+	}
+}
+
+// Qualified star with an unknown qualifier must broadcast, not drop: it surfaces
+// at minimum as the "*" sentinel on the only physical table in scope.
+func TestBughuntUnknownQualifierStarDropped(t *testing.T) {
+	got := rcHuntRun(t, `SELECT x.* FROM t`)
+	if cols, ok := got["t"]; !ok || len(cols) == 0 {
+		t.Errorf("SELECT x.* with an unknown qualifier was dropped (t has no columns) instead of being broadcast as the \"*\" sentinel; got %v", got)
+	}
+}
+
+// Correlated qualified star: t.* inside a subquery where t is only visible in
+// the OUTER scope. expandStar must walk parent scopes and fail open.
+func TestBughuntCorrelatedQualifiedStar(t *testing.T) {
+	got := rcHuntRun(t, `SELECT a FROM t WHERE EXISTS (SELECT t.* FROM r WHERE r.k = t.a)`)
+	cols := got["t"]
+	found := false
+	for _, c := range cols {
+		if c == "*" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("correlated t.* inside a subquery was dropped — expandStar must walk parent scopes and fail open; got %v", got)
+	}
+}
+
+// USING reads the column from BOTH joined tables (documented: USING columns are
+// counted; fail-open: never drop).
+func TestBughuntUsingBothSides(t *testing.T) {
+	got := rcHuntRun(t,
+		`SELECT u.name FROM hive.raw.users u JOIN hive.raw.orders o USING (id)`,
+		WithLineageMetadata(map[string][]string{
+			"hive.raw.users":  {"id", "name"},
+			"hive.raw.orders": {"id", "amt"},
+		}))
+	want := rcHuntWant(map[string][]string{
+		"hive.raw.users":  {"id", "name"},
+		"hive.raw.orders": {"id"},
+	})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("USING with column in both metadata entries:\n got %v\nwant %v", got, want)
+	}
+}
+
+// Unqualified column listed in TWO tables' metadata: attributed to both
+// (documented: "attributed to every in-scope source that declares it").
+func TestBughuntUnqualifiedInTwoTablesMetadata(t *testing.T) {
+	got := rcHuntRun(t,
+		`SELECT k FROM a JOIN b ON a.x = b.y`,
+		WithLineageMetadata(map[string][]string{
+			"a": {"k", "x"},
+			"b": {"k", "y"},
+		}))
+	want := rcHuntWant(map[string][]string{
+		"a": {"k", "x"},
+		"b": {"k", "y"},
+	})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("unqualified column in two metadata tables:\n got %v\nwant %v", got, want)
+	}
+}
+
+// Correlated subquery: unqualified column in the inner scope whose metadata
+// home is the OUTER table. Fail-open says it must not be dropped; metadata
+// attribution says it belongs to the declaring table.
+func TestBughuntCorrelatedUnqualifiedMetadata(t *testing.T) {
+	// "name" is declared only by hive.raw.users (outer). Inner scope's only
+	// source is orders.
+	got := rcHuntRun(t,
+		`SELECT u.id FROM hive.raw.users u WHERE EXISTS (SELECT 1 FROM hive.raw.orders o WHERE o.uid = u.id AND name = 'x')`,
+		WithLineageMetadata(rcHuntMeta))
+	// Not dropped is the hard requirement; attribution to users is what the
+	// metadata rule implies. Accept either users-only or broadcast including it.
+	all := map[string]bool{}
+	for tbl, cols := range got {
+		for _, c := range cols {
+			if c == "name" {
+				all[tbl] = true
+			}
+		}
+	}
+	if len(all) == 0 {
+		t.Errorf("correlated unqualified column 'name' dropped entirely: %v", got)
+	} else if !all["hive.raw.users"] {
+		// Out of scope (undocumented): metadata attribution across correlation.
+		// Still fail-open (not a drop), so only note it rather than fail.
+		t.Logf("NOTE: 'name' declared only by outer hive.raw.users but attributed to %v (metadata attribution not applied across correlation; still fail-open)", got)
+	}
+}
+
+// Set operation with trailing ORDER BY must not error or drop tables.
+func TestBughuntSetOpOrderBy(t *testing.T) {
+	got := rcHuntRun(t, `SELECT a FROM t UNION ALL SELECT b FROM r ORDER BY a`)
+	want := rcHuntWant(map[string][]string{"t": {"a"}, "r": {"b"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("set-op ORDER BY:\n got %v\nwant %v", got, want)
+	}
+}
+
+// Nested set-ops.
+func TestBughuntNestedSetOps(t *testing.T) {
+	got := rcHuntRun(t,
+		`SELECT a FROM t WHERE p > 0 UNION SELECT b FROM r EXCEPT SELECT c FROM s WHERE q < 1`)
+	want := rcHuntWant(map[string][]string{
+		"t": {"a", "p"}, "r": {"b"}, "s": {"c", "q"},
+	})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("nested set ops:\n got %v\nwant %v", got, want)
+	}
+}
+
+// QUALIFY + window ORDER BY inside OVER (snowflake).
+func TestBughuntQualifyWindow(t *testing.T) {
+	got := rcHuntRun(t,
+		`SELECT a FROM t QUALIFY row_number() OVER (PARTITION BY p ORDER BY q DESC) = 1`,
+		WithLineageDialect("snowflake"))
+	want := rcHuntWant(map[string][]string{"t": {"a", "p", "q"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("qualify window:\n got %v\nwant %v", got, want)
+	}
+}
+
+// CTE referenced twice under different aliases, each touching different columns.
+func TestBughuntCTETwiceDifferentColumns(t *testing.T) {
+	got := rcHuntRun(t,
+		`WITH c AS (SELECT a, b, d FROM t) SELECT c1.a FROM c c1 JOIN c c2 ON c1.b = c2.d`)
+	want := rcHuntWant(map[string][]string{"t": {"a", "b", "d"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("cte twice:\n got %v\nwant %v", got, want)
+	}
+}
+
+// CTE shadowing a physical table name, used from the main query only.
+func TestBughuntCTEShadowsPhysicalName(t *testing.T) {
+	got := rcHuntRun(t,
+		`WITH orders AS (SELECT uid FROM hive.raw.orders WHERE status = 'X') SELECT uid FROM orders`)
+	want := rcHuntWant(map[string][]string{"hive.raw.orders": {"status", "uid"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("cte shadow: bare CTE name must not surface as a physical table:\n got %v\nwant %v", got, want)
+	}
+}
+
+// Self-join: each alias touches different columns; both merge into one table.
+func TestBughuntSelfJoinDistinctColumns(t *testing.T) {
+	got := rcHuntRun(t,
+		`SELECT l.a, r.b FROM t l JOIN t r ON l.k1 = r.k2 WHERE l.w > 0 ORDER BY r.o`)
+	want := rcHuntWant(map[string][]string{"t": {"a", "b", "k1", "k2", "o", "w"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("self join:\n got %v\nwant %v", got, want)
+	}
+}
+
+// UPDATE ... SET with a table-qualified target column (mysql syntax) must
+// resolve to the bare column on the target table, not record it verbatim.
+func TestBughuntUpdateQualifiedSetTarget(t *testing.T) {
+	got := rcHuntRun(t, `UPDATE t SET t.x = t.y + 1 WHERE t.a > 1`, WithLineageDialect("mysql"))
+	want := rcHuntWant(map[string][]string{"t": {"a", "x", "y"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("table-qualified SET target must resolve to column \"x\" on t, not verbatim \"t.x\";\n got %v\nwant %v", got, want)
+	}
+}
+
+// DELETE with a subquery in WHERE.
+func TestBughuntDeleteWithSubquery(t *testing.T) {
+	got := rcHuntRun(t, `DELETE FROM t WHERE id IN (SELECT uid FROM r WHERE flag = 1)`)
+	want := rcHuntWant(map[string][]string{"t": {"id"}, "r": {"flag", "uid"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("delete subquery:\n got %v\nwant %v", got, want)
+	}
+}
+
+// MERGE with search conditions on WHEN clauses.
+func TestBughuntMergeWhenCondition(t *testing.T) {
+	got := rcHuntRun(t,
+		`MERGE INTO t USING r ON t.id = r.id WHEN MATCHED AND r.flag = 1 THEN DELETE`)
+	want := rcHuntWant(map[string][]string{"t": {"id"}, "r": {"flag", "id"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("merge when condition:\n got %v\nwant %v", got, want)
+	}
+}
+
+func TestBughuntOrderByOrdinal(t *testing.T) {
+	got := rcHuntRun(t, `SELECT a, b FROM t ORDER BY 1, b`)
+	want := rcHuntWant(map[string][]string{"t": {"a", "b"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("order by ordinal:\n got %v\nwant %v", got, want)
+	}
+}
+
+func TestBughuntHavingAggregate(t *testing.T) {
+	got := rcHuntRun(t, `SELECT g FROM t GROUP BY g HAVING max(h) - min(h2) > 3`)
+	want := rcHuntWant(map[string][]string{"t": {"g", "h", "h2"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("having aggregate:\n got %v\nwant %v", got, want)
+	}
+}
+
+// SELECT * with metadata for only one of two joined tables: the covered table
+// expands, the uncovered one keeps the "*" sentinel.
+func TestBughuntStarPartialMetadata(t *testing.T) {
+	got := rcHuntRun(t,
+		`SELECT * FROM hive.raw.users u JOIN unknown_tbl x ON u.id = x.k`,
+		WithLineageMetadata(map[string][]string{"hive.raw.users": {"id", "name"}}))
+	want := rcHuntWant(map[string][]string{
+		"hive.raw.users": {"id", "name"},
+		"unknown_tbl":    {"*", "k"},
+	})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("star partial metadata:\n got %v\nwant %v", got, want)
+	}
+}
+
+// Output hygiene: deduped and sorted per table.
+func TestBughuntDedupAndSorted(t *testing.T) {
+	got := rcHuntRun(t, `SELECT b, a, b FROM t WHERE a > 1 AND b < 2 ORDER BY a`)
+	want := rcHuntWant(map[string][]string{"t": {"a", "b"}})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("dedup/sort:\n got %v\nwant %v", got, want)
+	}
+	for tbl, cols := range got {
+		if !sort.StringsAreSorted(cols) {
+			t.Errorf("columns for %s not sorted: %v", tbl, cols)
+		}
+	}
+}
+
+// Three-part qualified column references cat.sch.tbl.col.
+func TestBughuntThreePartQualified(t *testing.T) {
+	got := rcHuntRun(t,
+		`SELECT c.s.t1.a FROM c.s.t1 JOIN c.s.t2 ON c.s.t1.k = c.s.t2.k WHERE c.s.t2.f > 0`)
+	want := rcHuntWant(map[string][]string{
+		"c.s.t1": {"a", "k"},
+		"c.s.t2": {"f", "k"},
+	})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("three-part qualified:\n got %v\nwant %v", got, want)
 	}
 }
