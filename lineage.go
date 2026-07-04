@@ -415,8 +415,8 @@ func parseFirstStatement(client *polyglot.Client, sql, dialect string) (map[stri
 		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
 	stmts = dropNils(stmts)
-	if len(stmts) == 0 {
-		return nil, fmt.Errorf("%w: no statement to analyze", ErrUnsupported)
+	if len(stmts) != 1 {
+		return nil, fmt.Errorf("%w: expected exactly one statement, got %d", ErrUnsupported, len(stmts))
 	}
 	stmt, ok := stmts[0].(map[string]any)
 	if !ok {
