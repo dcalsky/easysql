@@ -229,6 +229,14 @@ func (r *rewriter) compileWhere(whereClause string) error {
 		return fmt.Errorf("easysql: invalid where clause %q: not a boolean expression", whereClause)
 	}
 	r.whereText = strings.TrimSpace(whereClause)
+	// Build the subquery template now so a predicate that validates on its own
+	// but cannot be safely spliced into the filter subquery (e.g. one ending in
+	// a line comment that would swallow the template's closing paren) is
+	// reported here as a plain configuration error, rather than later as an
+	// ErrInternal from the rewrite.
+	if _, err := r.subqueryTemplate(); err != nil {
+		return fmt.Errorf("easysql: where clause %q cannot be safely applied as a filter predicate", whereClause)
+	}
 	return nil
 }
 
@@ -282,36 +290,46 @@ func (r *rewriter) rewrite(sql string) (string, error) {
 		return "", err
 	}
 
-	strip := map[string]bool{}
-	wrapped := 0
-	var tmpl map[string]any
+	// Collect the in-scope physical-table references to wrap. Reuse the
+	// RewriteTableReferences machinery for collision-free derived-table alias
+	// assignment and for rebinding qualified column / star references onto those
+	// aliases, so the two rewrite paths behave identically.
+	var matches []*tableMatch
 	for _, d := range decs {
 		if !d.wrap {
 			continue
 		}
-		if tmpl == nil {
-			if tmpl, err = r.subqueryTemplate(); err != nil {
-				return "", err
-			}
+		table, _ := d.node["table"].(map[string]any)
+		if table == nil {
+			continue
 		}
-		r.wrapTableNode(d.node, tmpl)
-		wrapped++
-		if d.strip {
-			strip[d.stripKey] = true
-		}
+		matches = append(matches, newTableMatch(d.node, table, compiledTableRewrite{}))
 	}
 
 	// Nothing in scope: a genuine no-op. Return the input unchanged instead of
 	// round-tripping it through the generator -- that would reformat untouched
 	// SQL for no reason and, for pathological input, the generator cannot always
 	// reproduce valid SQL.
-	if wrapped == 0 {
+	if len(matches) == 0 {
 		return sql, nil
 	}
 
-	if len(strip) > 0 {
-		stripSchemaAST(stmts[0], strip)
+	tmpl, err := r.subqueryTemplate()
+	if err != nil {
+		return "", err
 	}
+
+	// Assign a unique derived-table alias to every wrapped reference (so two
+	// same-named tables in different schemas, or a table colliding with a CTE
+	// name, do not produce duplicate FROM relations), then wrap each table in
+	// its predicate-filtered subquery and rebind schema-/catalog-qualified
+	// column and star references onto the assigned aliases.
+	assignDerivedAliases(stmts[0], matches)
+	rebindCtx := buildRebindContext(matches)
+	for _, m := range matches {
+		r.wrapTableNode(m.node, tmpl, m.alias)
+	}
+	rebindColumnRefs(stmts[0], rebindCtx)
 
 	gen, err := r.client.Generate(mustMarshal(stmts), r.pg)
 	if err != nil || len(gen) == 0 {
@@ -373,21 +391,12 @@ func (r *rewriter) subqueryTemplate() (map[string]any, error) {
 
 // wrapTableNode converts an AST table node ({"table": ...}) in place into a
 // filtered-subquery node ({"subquery": ...}). The original table (with its alias
-// stripped) becomes the subquery's inner FROM table, and the subquery inherits
-// the table's alias (or, when there is none, its name).
-func (r *rewriter) wrapTableNode(node map[string]any, tmpl map[string]any) {
+// stripped) becomes the subquery's inner FROM table, and the subquery is aliased
+// with the collision-free alias assigned by assignDerivedAliases.
+func (r *rewriter) wrapTableNode(node map[string]any, tmpl map[string]any, alias aliasRef) {
 	orig, _ := node["table"].(map[string]any)
 	if orig == nil {
 		return
-	}
-
-	// Alias for the derived table: the explicit alias when present, otherwise
-	// the table's own name identifier.
-	var aliasNode any
-	if a, ok := orig["alias"].(map[string]any); ok && a != nil {
-		aliasNode = deepCopyJSON(a)
-	} else {
-		aliasNode = deepCopyJSON(orig["name"])
 	}
 
 	// Inner table = the original, minus its alias (the alias moves outward).
@@ -395,7 +404,7 @@ func (r *rewriter) wrapTableNode(node map[string]any, tmpl map[string]any) {
 	innerTable["alias"] = nil
 
 	sub, _ := deepCopyJSON(tmpl).(map[string]any)
-	sub["alias"] = aliasNode
+	sub["alias"] = newIdent(alias.name, alias.quoted)
 	if sel, ok := dig(sub, "this", "select"); ok {
 		if selMap, ok := sel.(map[string]any); ok {
 			if from, ok := selMap["from"].(map[string]any); ok {
@@ -408,60 +417,6 @@ func (r *rewriter) wrapTableNode(node map[string]any, tmpl map[string]any) {
 
 	delete(node, "table")
 	node["subquery"] = sub
-}
-
-// stripSchemaAST rewrites three-part column references schema.table.col -> table.col
-// for every (schema, table) in strip, so they keep resolving against the derived
-// table aliased by the bare table name. In the AST a three-part reference is a
-// Dot over a two-part Column:
-//
-//	{"dot": {"field": <col>, "this": {"column": {"name": <table>, "table": <schema>}}}}
-//
-// which becomes a plain two-part column {"column": {"name": <col>, "table": <table>}}.
-func stripSchemaAST(node any, strip map[string]bool) {
-	switch v := node.(type) {
-	case map[string]any:
-		if dn, ok := v["dot"].(map[string]any); ok && stripDot(v, dn, strip) {
-			return // replaced in place; nothing deeper to strip here
-		}
-		for _, child := range v {
-			stripSchemaAST(child, strip)
-		}
-	case []any:
-		for _, child := range v {
-			stripSchemaAST(child, strip)
-		}
-	}
-}
-
-// stripDot tries to collapse a schema.table.col Dot node (held in v under "dot")
-// into a table.col Column. It reports whether it replaced the node.
-func stripDot(v, dn map[string]any, strip map[string]bool) bool {
-	this, _ := dn["this"].(map[string]any)
-	if this == nil {
-		return false
-	}
-	col, _ := this["column"].(map[string]any)
-	if col == nil {
-		return false
-	}
-	schema := identName(col["table"]) // the "sales" in sales.orders
-	table := identName(col["name"])   // the "orders" in sales.orders
-	if schema == "" || table == "" {
-		return false
-	}
-	if !strip[strings.ToLower(schema)+"\x00"+strings.ToLower(table)] {
-		return false
-	}
-	newCol := map[string]any{
-		"join_mark":         false,
-		"name":              dn["field"], // the ".col" identifier
-		"table":             col["name"], // the "orders" identifier
-		"trailing_comments": []any{},
-	}
-	delete(v, "dot")
-	v["column"] = newCol
-	return true
 }
 
 // deepCopyJSON returns a deep copy of a value decoded from JSON (maps, slices
@@ -530,10 +485,8 @@ func (r *rewriter) matches(v map[string]any) bool {
 
 // tableDecision describes one physical-table reference found in the AST.
 type tableDecision struct {
-	wrap     bool           // wrap this reference in a filtered subquery
-	strip    bool           // outer schema.table.col refs must drop the schema
-	stripKey string         // "schema\x00table" for stripping
-	node     map[string]any // the AST {"table":...} node, mutated in place when wrapped
+	wrap bool           // wrap this reference in a filtered subquery
+	node map[string]any // the AST {"table":...} node, mutated in place when wrapped
 }
 
 // collect walks the AST in source order, appending one tableDecision per
@@ -602,14 +555,25 @@ func (r *rewriter) pushCTEs(body map[string]any, scope []map[string]bool, out *[
 	if !ok {
 		return scope
 	}
+	names := cteNames(w)
+
+	// The scope under which the CTE definition bodies are visited. A
+	// non-recursive CTE cannot shadow a real table of the same name inside its
+	// own definition, so its body is visited under the OUTER scope. A RECURSIVE
+	// WITH, however, makes the CTE names visible inside the bodies themselves
+	// (self- and mutual references), so those references denote the CTE and must
+	// NOT be wrapped as physical tables.
+	bodyScope := scope
+	if recursive, _ := w["recursive"].(bool); recursive && len(names) > 0 {
+		bodyScope = append(append([]map[string]bool{}, scope...), names)
+	}
 	if list, ok := w["ctes"].([]any); ok {
 		for _, e := range list {
 			if cte, ok := e.(map[string]any); ok {
-				r.collect(cte["this"], scope, out)
+				r.collect(cte["this"], bodyScope, out)
 			}
 		}
 	}
-	names := cteNames(w)
 	if len(names) > 0 {
 		return append(append([]map[string]bool{}, scope...), names)
 	}
@@ -621,22 +585,16 @@ func (r *rewriter) decide(v map[string]any, scope []map[string]bool) *tableDecis
 	t := v["table"].(map[string]any)
 	name := strings.ToLower(identName(t["name"]))
 	schema := identName(t["schema"])
+	catalog := identName(t["catalog"])
 
 	d := &tableDecision{node: v}
-	if inScope(name, scope) {
+	// Only an unqualified name can denote a CTE; a schema- or catalog-qualified
+	// reference always refers to a physical table, even when a CTE shares its
+	// bare name.
+	if schema == "" && catalog == "" && inScope(name, scope) {
 		return d // CTE reference: never wrapped
 	}
 	d.wrap = r.matches(v)
-	if !d.wrap {
-		return d
-	}
-	// A derived-table alias is synthesized from the bare name when the table has
-	// no explicit alias, so schema-qualified column references (schema.table.col)
-	// must drop the schema to keep resolving.
-	if _, hasAlias := t["alias"].(map[string]any); !hasAlias && schema != "" {
-		d.strip = true
-		d.stripKey = strings.ToLower(schema) + "\x00" + name
-	}
 	return d
 }
 

@@ -54,9 +54,7 @@ func parseColumns(client *polyglot.Client, sql string, opts ...LineageOption) ([
 	for _, o := range opts {
 		o(&cfg)
 	}
-	if strings.TrimSpace(cfg.dialect) == "" {
-		cfg.dialect = "trino"
-	}
+	cfg.dialect = normalizeLineageDialect(cfg.dialect)
 
 	stmt, err := parseFirstStatement(client, sql, cfg.dialect)
 	if err != nil {
@@ -190,6 +188,7 @@ func createTableDDLColumns(stmt map[string]any, metadata map[string][]string) ([
 
 	var out []string
 	inlineLike := false
+	likeExpanded := false
 	for _, item := range rawCols {
 		col, ok := item.(map[string]any)
 		if !ok {
@@ -202,6 +201,7 @@ func createTableDDLColumns(stmt map[string]any, metadata map[string][]string) ([
 			}
 			out = append(out, expanded...)
 			inlineLike = true
+			likeExpanded = true
 			continue
 		}
 		if n := identName(col["name"]); n != "" {
@@ -224,6 +224,7 @@ func createTableDDLColumns(stmt map[string]any, metadata map[string][]string) ([
 			return nil, err
 		}
 		likeCols = append(likeCols, expanded...)
+		likeExpanded = true
 	}
 
 	if len(likeCols) > 0 && !inlineLike {
@@ -239,6 +240,12 @@ func createTableDDLColumns(stmt map[string]any, metadata map[string][]string) ([
 	if len(out) == 0 {
 		if len(likeCols) > 0 {
 			return likeCols, nil
+		}
+		// A LIKE clause was expanded but the source table exposes zero columns.
+		// Return a non-nil empty slice so callers distinguish "a query defining
+		// no columns" from nil, which means "not a column-producing statement".
+		if likeExpanded {
+			return []string{}, nil
 		}
 		return nil, nil
 	}
@@ -279,14 +286,10 @@ func lookupMetadataColumns(metadata map[string][]string, tableRef string) ([]str
 	if cols, ok := metadata[tableRef]; ok {
 		return append([]string{}, cols...), true
 	}
-	suffix := tableRef
-	if !strings.Contains(tableRef, ".") {
-		suffix = "." + tableRef
-	}
 	var found []string
 	var count int
 	for key, cols := range metadata {
-		if key == tableRef || strings.HasSuffix(key, suffix) {
+		if hasTableSuffix(key, tableRef) {
 			found = cols
 			count++
 		}
@@ -302,53 +305,130 @@ func columnsFromAnalysis(a polyglot.QueryAnalysis, metadata map[string][]string)
 		return []string{"*"}
 	}
 
-	starByIndex := make(map[int]polyglot.StarProjectionFact, len(a.StarProjections))
-	starSpan := make(map[int]int, len(a.StarProjections))
-	for _, sp := range a.StarProjections {
-		starByIndex[sp.Index] = sp
-		if len(sp.ExpandedColumns) > 0 && !isPlaceholderStar(sp.ExpandedColumns) {
-			starSpan[sp.Index] = len(sp.ExpandedColumns)
-		}
+	// When a star was left un-expanded by the engine (empty or placeholder "*"
+	// expansion — e.g. a star over a CTE/derived table or a set-operation
+	// branch), a.Projections already carries the fully expanded output in engine
+	// order. Treat the whole projection list as the star expansion and order it
+	// by metadata.
+	if hasUntrackedStar(a) {
+		return finalizeColumnOrder(untrackedStarColumns(a, metadata), a, metadata)
 	}
 
-	out := make([]string, 0, len(a.Projections))
-	for i := 0; i < len(a.Projections); {
-		if n, ok := starSpan[i]; ok {
-			out = append(out, orderStarColumns(starByIndex[i], a, metadata)...)
-			i += n
-			continue
-		}
-		p := a.Projections[i]
-		if p.IsStar {
-			if sp, ok := starByIndex[p.Index]; ok {
-				if len(sp.ExpandedColumns) == 0 {
-					if cols, known := resolveStarFromMetadata(sp, a, metadata); known {
-						out = append(out, cols...)
-						i++
-						continue
-					}
-				} else if expanded := orderStarColumns(sp, a, metadata); len(expanded) > 0 {
-					out = append(out, expanded...)
-					i++
-					continue
-				}
-			}
-			if p.Name != nil && *p.Name != "" {
-				out = append(out, *p.Name)
-			} else {
-				out = append(out, "*")
-			}
-			i++
-			continue
-		}
-		if p.Name != nil && *p.Name != "" {
-			out = append(out, *p.Name)
-		} else {
-			out = append(out, fmt.Sprintf("_col%d", p.Index))
-		}
-		i++
+	// Otherwise every star carries a concrete expansion. Explicit projections and
+	// each star run keep their left-to-right position; only the columns inside a
+	// star run are reordered (to metadata order). Walk by the original
+	// projection slot: StarProjection.Index is the pre-expansion slot index,
+	// which differs from the flat a.Projections index, so a naive walk over
+	// a.Projections misaligns when a star is preceded by another star.
+	spByOrig := make(map[int]polyglot.StarProjectionFact, len(a.StarProjections))
+	for _, sp := range a.StarProjections {
+		spByOrig[sp.Index] = sp
 	}
-	return finalizeColumnOrder(out, a, metadata)
+	out := make([]string, 0, len(a.Projections))
+	f := 0
+	for slot := 0; f < len(a.Projections); slot++ {
+		if sp, ok := spByOrig[slot]; ok {
+			out = append(out, orderStarColumns(sp, a, metadata)...)
+			f += len(sp.ExpandedColumns)
+			continue
+		}
+		out = append(out, resolvedProjectionName(a, f))
+		f++
+	}
+	return out
+}
+
+// untrackedStarColumns produces the flat output-column names for an analysis
+// whose stars the engine did not concretely expand, resolving any remaining
+// star projection from metadata when possible.
+func untrackedStarColumns(a polyglot.QueryAnalysis, metadata map[string][]string) []string {
+	out := make([]string, 0, len(a.Projections))
+	for i, p := range a.Projections {
+		if p.IsStar {
+			if cols, known := resolveStarFromMetadata(starForProjection(a, p), a, metadata); known {
+				out = append(out, cols...)
+				continue
+			}
+		}
+		out = append(out, resolvedProjectionName(a, i))
+	}
+	return out
+}
+
+func starForProjection(a polyglot.QueryAnalysis, p polyglot.ProjectionFact) polyglot.StarProjectionFact {
+	for _, sp := range a.StarProjections {
+		if sp.Index == p.Index {
+			return sp
+		}
+	}
+	return polyglot.StarProjectionFact{}
+}
+
+// resolvedProjectionName returns the exposed name for the flat projection at
+// flatIndex, correcting two engine naming quirks for unaliased computed
+// projections:
+//   - Without metadata, an unaliased leading aggregate/expression is mislabeled
+//     with the following projection's name (e.g. `SELECT count(*), a` reports
+//     both as "a"). Such a stolen name is replaced with the documented
+//     `_col{index}` synthetic name.
+//   - With metadata, the engine emits an internal `_col_{n}` (extra underscore);
+//     normalize it to the documented `_col{n}`.
+func resolvedProjectionName(a polyglot.QueryAnalysis, flatIndex int) string {
+	p := a.Projections[flatIndex]
+	if p.Name != nil && *p.Name != "" {
+		if isStolenProjectionName(a, flatIndex) {
+			return fmt.Sprintf("_col%d", p.Index)
+		}
+		return normalizeSyntheticColumnName(*p.Name)
+	}
+	if p.IsStar {
+		return "*"
+	}
+	return fmt.Sprintf("_col%d", p.Index)
+}
+
+// isStolenProjectionName detects the engine quirk where an unaliased computed
+// projection (aggregation/expression, not a plain column) is assigned the name
+// of the immediately following projection.
+func isStolenProjectionName(a polyglot.QueryAnalysis, flatIndex int) bool {
+	p := a.Projections[flatIndex]
+	if p.Name == nil || p.IsStar || p.TransformKind == "direct" {
+		return false
+	}
+	if flatIndex+1 >= len(a.Projections) {
+		return false
+	}
+	next := a.Projections[flatIndex+1]
+	return next.Name != nil && p.Name != nil && *next.Name == *p.Name
+}
+
+// normalizeSyntheticColumnName converts an engine-internal `_col_{n}` name to
+// the documented `_col{n}` form, leaving all other names untouched.
+func normalizeSyntheticColumnName(name string) string {
+	const prefix = "_col_"
+	if !strings.HasPrefix(name, prefix) || len(name) == len(prefix) {
+		return name
+	}
+	for _, r := range name[len(prefix):] {
+		if r < '0' || r > '9' {
+			return name
+		}
+	}
+	return "_col" + name[len(prefix):]
+}
+
+// hasUntrackedStar reports whether the analysis contains a star projection that
+// the engine did not expand into concrete columns (empty expansion) or expanded
+// only symbolically (a "*" placeholder). In those cases a.Projections already
+// carries the expanded columns but in engine order, so downstream ordering must
+// treat the whole projection list as a star expansion.
+func hasUntrackedStar(a polyglot.QueryAnalysis) bool {
+	for _, sp := range a.StarProjections {
+		if len(sp.ExpandedColumns) == 0 || isPlaceholderStar(sp.ExpandedColumns) {
+			return true
+		}
+	}
+	return false
 }
 
 func isPlaceholderStar(cols []string) bool {
@@ -370,10 +450,68 @@ func finalizeColumnOrder(out []string, a polyglot.QueryAnalysis, metadata map[st
 	if spansMultipleMetadataTables(out, metadata) {
 		return reorderMultiTableStar(out, metadata)
 	}
-	if len(a.BaseTables) == 1 {
-		return orderExpandedColumns(out, nil, a, metadata)
+	// All recognized output columns belong to a single metadata table. Order by
+	// that table's metadata even when several base tables exist (e.g. a
+	// single-table star on one branch of a UNION whose other branch adds tables).
+	if table := soleMetadataTable(out, metadata); table != "" {
+		if cols, ok := lookupMetadataColumns(metadata, table); ok {
+			return orderColumnsByMetadata(out, cols)
+		}
 	}
 	return out
+}
+
+// soleMetadataTable returns the single metadata table that every recognized
+// column in cols belongs to, or "" if the columns map to more than one table or
+// none are recognized.
+func soleMetadataTable(cols []string, metadata map[string][]string) string {
+	colToTable := make(map[string]string)
+	for table, tableCols := range metadata {
+		for _, c := range tableCols {
+			colToTable[c] = table
+		}
+	}
+	var seen string
+	for _, c := range cols {
+		table := colToTable[c]
+		if table == "" {
+			continue
+		}
+		if seen == "" {
+			seen = table
+			continue
+		}
+		if table != seen {
+			return ""
+		}
+	}
+	return seen
+}
+
+// orderColumnsByMetadata returns cols reordered to match metadataCols order. If
+// the set of cols does not exactly match the metadata columns present, the
+// original order is preserved (the output is not a full star over the table).
+func orderColumnsByMetadata(cols, metadataCols []string) []string {
+	set := make(map[string]struct{}, len(cols))
+	for _, c := range cols {
+		set[c] = struct{}{}
+	}
+	ordered := make([]string, 0, len(cols))
+	added := make(map[string]struct{}, len(cols))
+	for _, c := range metadataCols {
+		if _, in := set[c]; !in {
+			continue
+		}
+		if _, dup := added[c]; dup {
+			continue
+		}
+		ordered = append(ordered, c)
+		added[c] = struct{}{}
+	}
+	if len(ordered) == len(cols) {
+		return ordered
+	}
+	return cols
 }
 
 func spansMultipleMetadataTables(cols []string, metadata map[string][]string) bool {
@@ -493,6 +631,22 @@ func orderExpandedColumns(expanded []string, starTable *string, a polyglot.Query
 			return expanded
 		}
 		tables = a.BaseTables
+	}
+
+	// Only reorder a genuine full star over the target table(s): every metadata
+	// column must be present in the expansion. A subset (e.g. a star over a CTE
+	// that projects only some columns, or a renamed subquery) keeps the engine's
+	// projection order rather than being forced into metadata order.
+	for _, bt := range tables {
+		cols, ok := lookupMetadataColumns(metadata, bt.Name)
+		if !ok {
+			return expanded
+		}
+		for _, c := range cols {
+			if _, in := expandedSet[c]; !in {
+				return expanded
+			}
+		}
 	}
 
 	ordered := make([]string, 0, len(expanded))

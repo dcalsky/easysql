@@ -386,3 +386,314 @@ func TestDialectBoundary(t *testing.T) {
 	}
 	t.Logf("dialect coverage: %d/%d parsed+rewritten+validated", pass, len(cases))
 }
+
+// ---------------------------------------------------------------------------
+// Bug-hunt probes for ApplyRowFilter and its options. Each test asserts the
+// behavior justified by the documented semantics (package doc in easysql.go,
+// README.md "ApplyRowFilter" section).
+// ---------------------------------------------------------------------------
+
+// bughuntWraps counts how many tables were wrapped by counting the marker
+// literal in the output (same technique as countLiterals).
+func bughuntWraps(t *testing.T, out, dialect string) int {
+	t.Helper()
+	return countLiterals(t, out, dialectToPolyglot[dialect], testMarker)
+}
+
+// bughuntApply runs ApplyRowFilter and asserts only that it succeeds and the
+// output re-parses; semantic assertions are left to each probe.
+func bughuntApply(t *testing.T, dialect, sql string, opts ...Option) string {
+	t.Helper()
+	all := append([]Option{WithDialect(dialect)}, opts...)
+	out, err := ApplyRowFilter(sql, testWhere, all...)
+	if err != nil {
+		t.Fatalf("ApplyRowFilter(%q): %v", sql, err)
+	}
+	if _, err := testClient.ParseOne(out, dialectToPolyglot[dialect]); err != nil {
+		t.Fatalf("output does not re-parse:\n in:  %s\n out: %s\n err: %v", sql, out, err)
+	}
+	return out
+}
+
+// bughuntRelationNames returns the multiset of relation names bound by
+// FROM/JOIN entries (aliases when present, bare table names otherwise) at
+// every query level of the parsed output SQL.
+func bughuntRelationNames(t *testing.T, sql, pg string) []string {
+	t.Helper()
+	raw, err := testClient.ParseOne(sql, pg)
+	if err != nil {
+		t.Fatalf("re-parse %q: %v", sql, err)
+	}
+	var node any
+	if err := json.Unmarshal(raw, &node); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	walkJSON(node, func(m map[string]any) {
+		if n, ok := relationEntryName(m); ok {
+			names = append(names, n)
+		}
+	})
+	return names
+}
+
+// bughuntDuplicateInScope re-parses sql and reports the first relation name
+// bound more than once within a SINGLE FROM/JOIN scope (the condition that
+// triggers MySQL error 1066 "Not unique table/alias"). Two same-named
+// relations living in DIFFERENT query scopes (e.g. a physical table `s1.t`
+// inside one derived subquery and `s2.t` inside another) are legal and are not
+// reported.
+func bughuntDuplicateInScope(t *testing.T, sql, pg string) (string, bool) {
+	t.Helper()
+	raw, err := testClient.ParseOne(sql, pg)
+	if err != nil {
+		t.Fatalf("re-parse %q: %v", sql, err)
+	}
+	var node any
+	if err := json.Unmarshal(raw, &node); err != nil {
+		t.Fatal(err)
+	}
+	dupName := ""
+	found := false
+	walkJSON(node, func(m map[string]any) {
+		if found {
+			return
+		}
+		// A SELECT body carries its FROM/JOIN entries directly; only inspect
+		// nodes that actually have a FROM clause so each scope is checked once.
+		if _, ok := m["from"]; !ok {
+			return
+		}
+		seen := map[string]bool{}
+		for _, entry := range fromJoinEntries(m) {
+			if n, ok := relationEntryName(entry); ok {
+				if seen[n] {
+					dupName, found = n, true
+					return
+				}
+				seen[n] = true
+			}
+		}
+	})
+	return dupName, found
+}
+
+// Duplicate derived-table aliases for same-named tables in different schemas:
+// joining s1.t with s2.t must give each wrapped derived table a distinct alias
+// (assignDerivedAliases), so no single FROM scope has two relations named `t`
+// (which would be MySQL error 1066).
+func TestBughuntDuplicateAliasSameBareNameJoin(t *testing.T) {
+	sql := "select s1.t.id, s2.t.name from s1.t join s2.t on s1.t.id = s2.t.id"
+	out := bughuntApply(t, "mysql", sql)
+
+	if n, dup := bughuntDuplicateInScope(t, out, "mysql"); dup {
+		t.Fatalf("duplicate relation name %q in a single rewritten FROM:\n in:  %s\n out: %s", n, sql, out)
+	}
+}
+
+// A derived-table alias must not collide with a same-named CTE referenced in
+// the same FROM: a schema-qualified db.t is wrapped with a distinct alias so
+// the outer FROM does not bind two relations named `t`.
+func TestBughuntCTENameCollidesWithDerivedAlias(t *testing.T) {
+	sql := "with t as (select 1 as id) select db.t.id, t.id from db.t join t on db.t.id = t.id"
+	out := bughuntApply(t, "mysql", sql)
+
+	if n, dup := bughuntDuplicateInScope(t, out, "mysql"); dup {
+		t.Fatalf("duplicate relation name %q in a single rewritten FROM:\n in:  %s\n out: %s", n, sql, out)
+	}
+}
+
+// A recursive CTE's self-reference denotes the CTE, not a physical table, so
+// the recursive branch's `from c` must not be wrapped.
+func TestBughuntRecursiveCTESelfReference(t *testing.T) {
+	sql := "with recursive c as (select 1 as n union all select n + 1 from c where n < 3) select * from c"
+	out := bughuntApply(t, "mysql", sql)
+	if got := bughuntWraps(t, out, "mysql"); got != 0 {
+		t.Fatalf("recursive CTE self-reference must not be wrapped, got %d wrap(s); out: %s", got, out)
+	}
+}
+
+// A schema-qualified star (schema.table.*) must be rebound to the derived-table
+// alias after wrapping (sales.orders.* -> orders.*).
+func TestBughuntQualifiedStarNotRebound(t *testing.T) {
+	sql := "select sales.orders.*, 1 from sales.orders"
+	out := bughuntApply(t, "mysql", sql)
+	if !strings.Contains(out, "orders.*") {
+		t.Fatalf("expected qualified star rebound to orders.*:\n in:  %s\n out: %s", sql, out)
+	}
+}
+
+// Catalog-qualified column refs (catalog.schema.table.col) must be rebound to
+// the derived-table alias when a catalog-qualified table is wrapped
+// (hive.sales.a.col1 -> a.col1).
+func TestBughuntCatalogQualifiedColumnRefNotStripped(t *testing.T) {
+	sql := "select hive.sales.a.col1 from hive.sales.a"
+	out := bughuntApply(t, "trino", sql)
+	if !strings.Contains(out, "a.col1") {
+		t.Fatalf("expected column ref rebound to a.col1:\n in:  %s\n out: %s", sql, out)
+	}
+}
+
+// The predicate must reach tables referenced from WHERE-clause subqueries
+// (EXISTS / IN), per "keeps the rewrite correct across ... subqueries".
+func TestBughuntSubqueryInExists(t *testing.T) {
+	out := bughuntApply(t, "mysql",
+		"select * from c where exists (select 1 from a where a.cid = c.id)",
+		WithTableNames("a"))
+	if got := bughuntWraps(t, out, "mysql"); got != 1 {
+		t.Fatalf("want 1 wrap (table a inside EXISTS), got %d: %s", got, out)
+	}
+}
+
+// Set operations: every physical table in every branch is wrapped, including
+// nested set-ops and branch-local CTE shadowing.
+func TestBughuntSetOpsAndCTEShadowing(t *testing.T) {
+	sql := "select * from t union select * from (with t as (select 1 as id) select * from t) q intersect select * from t"
+	out := bughuntApply(t, "mysql", sql)
+	// Two real `t` references (branch 1 and branch 3); the CTE-shadowed one is
+	// not wrapped.
+	if got := bughuntWraps(t, out, "mysql"); got != 2 {
+		t.Fatalf("want 2 wraps across set-op branches, got %d: %s", got, out)
+	}
+}
+
+// Self-join with aliases: both sides wrapped, aliases preserved (no
+// collision because the explicit aliases differ).
+func TestBughuntSelfJoinAliases(t *testing.T) {
+	out := bughuntApply(t, "mysql",
+		"select t1.id from sales.orders t1 join sales.orders t2 on t1.pid = t2.id")
+	if got := bughuntWraps(t, out, "mysql"); got != 2 {
+		t.Fatalf("want 2 wraps, got %d: %s", got, out)
+	}
+	for _, alias := range []string{"t1", "t2"} {
+		found := false
+		for _, n := range bughuntRelationNames(t, out, "mysql") {
+			if n == alias {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("explicit alias %q lost: %s", alias, out)
+		}
+	}
+}
+
+// LATERAL: the lateral subquery's table is wrapped; the correlated outer
+// reference keeps resolving.
+func TestBughuntLateral(t *testing.T) {
+	out := bughuntApply(t, "postgres",
+		"select * from a, lateral (select * from b where b.aid = a.id) s")
+	if got := bughuntWraps(t, out, "postgres"); got != 2 {
+		t.Fatalf("want 2 wraps, got %d: %s", got, out)
+	}
+}
+
+// Dialect quoting: postgres double quotes and mysql backticks are both
+// preserved on wrapped reserved-word tables (README "Quoting preserved").
+func TestBughuntDialectQuoting(t *testing.T) {
+	outPg := bughuntApply(t, "postgres", `select * from "order"`)
+	if !strings.Contains(outPg, `"order"`) {
+		t.Fatalf("postgres quoting lost: %s", outPg)
+	}
+	outMy := bughuntApply(t, "mysql", "select * from `order`")
+	if !strings.Contains(outMy, "`order`") {
+		t.Fatalf("mysql backtick quoting lost: %s", outMy)
+	}
+}
+
+// WithTableNames bare name matches the table in any schema; schema-qualified
+// scope requires the schema (resolved via WithDefaultDB for bare refs).
+func TestBughuntTableNamesMatching(t *testing.T) {
+	// bare scope name matches schema-qualified reference
+	out := bughuntApply(t, "mysql", "select * from sales.orders", WithTableNames("orders"))
+	if got := bughuntWraps(t, out, "mysql"); got != 1 {
+		t.Fatalf("bare scope should match sales.orders, wraps=%d: %s", got, out)
+	}
+	// qualified scope does not match a bare ref without WithDefaultDB
+	out = bughuntApply(t, "mysql", "select * from orders", WithTableNames("sales.orders"))
+	if got := bughuntWraps(t, out, "mysql"); got != 0 {
+		t.Fatalf("qualified scope must not match bare ref without default DB, wraps=%d: %s", got, out)
+	}
+	// ... and matches with WithDefaultDB
+	out = bughuntApply(t, "mysql", "select * from orders",
+		WithTableNames("sales.orders"), WithDefaultDB("sales"))
+	if got := bughuntWraps(t, out, "mysql"); got != 1 {
+		t.Fatalf("qualified scope + default DB should match bare ref, wraps=%d: %s", got, out)
+	}
+	// WithDefaultDB must not leak the other way: qualified ref in a different
+	// schema stays out of scope.
+	out = bughuntApply(t, "mysql", "select * from hr.orders",
+		WithTableNames("sales.orders"), WithDefaultDB("sales"))
+	if got := bughuntWraps(t, out, "mysql"); got != 0 {
+		t.Fatalf("hr.orders must not match sales.orders scope, wraps=%d: %s", got, out)
+	}
+}
+
+// A CTE name in scope must not suppress wrapping of a physical table with the
+// same bare name in a SIBLING scope (regression family of TestCTEScopeSecurity).
+func TestBughuntCTESiblingScope(t *testing.T) {
+	sql := "select * from (with x as (select 1 as id) select * from x) a join x on a.id = x.id"
+	out := bughuntApply(t, "mysql", sql)
+	// Outer x is a physical table (the CTE x is confined to the derived table).
+	if got := bughuntWraps(t, out, "mysql"); got != 1 {
+		t.Fatalf("want 1 wrap (outer physical x), got %d: %s", got, out)
+	}
+}
+
+// Injection-ish whereClause values must be rejected at compile time (config
+// error), never producing SQL where the predicate escapes the subquery WHERE.
+func TestBughuntWhereClauseInjectionRejected(t *testing.T) {
+	bad := []string{
+		"1=1) as x --",                    // paren escape
+		"1=1 union select * from secrets", // set-op smuggling
+		"1=1; drop table a",               // second statement
+	}
+	for _, w := range bad {
+		if _, err := ApplyRowFilter("select * from a", w, WithDialect("mysql")); err == nil {
+			t.Fatalf("whereClause %q accepted; expected rejection", w)
+		}
+	}
+	// A line-comment suffix parses in validation ("SELECT 1 WHERE p -- c") but
+	// would comment out the template's closing paren. It must fail (any error
+	// class), never emit malformed or predicate-escaped SQL.
+	out, err := ApplyRowFilter("select * from a", "tenant = 'alice' -- boom", WithDialect("mysql"))
+	if err == nil {
+		if _, perr := testClient.ParseOne(out, "mysql"); perr != nil {
+			t.Fatalf("comment-suffixed whereClause produced unparseable SQL: %s", out)
+		}
+	}
+}
+
+// Idempotency probe: applying the filter to its own output must still be
+// valid SQL (the second pass re-wraps the inner physical table, which is
+// semantically idempotent for an idempotent predicate; not asserting wrap
+// counts because idempotency is not documented).
+func TestBughuntDoubleApplyStillValid(t *testing.T) {
+	out1 := bughuntApply(t, "mysql", "select * from a")
+	out2 := bughuntApply(t, "mysql", out1)
+	if got := bughuntWraps(t, out2, "mysql"); got < 1 {
+		t.Fatalf("second application lost the filter entirely: %s", out2)
+	}
+}
+
+// Quoted case-sensitive identifiers: scope matching is case-insensitive even
+// for quoted identifiers. Postgres treats "Orders" and orders as DIFFERENT
+// tables; matching is lower-cased on both sides, so scoping "orders" also
+// wraps "Orders". This only ever OVER-filters (extra predicate, fail-safe
+// direction), so it is noted as suspicious, not asserted as a bug.
+func TestBughuntQuotedCaseInsensitiveScope(t *testing.T) {
+	out := bughuntApply(t, "postgres", `select * from "Orders"`, WithTableNames("orders"))
+	t.Logf("case-insensitive scope wraps quoted \"Orders\": wraps=%d out=%s",
+		bughuntWraps(t, out, "postgres"), out)
+	if !strings.Contains(out, `"Orders"`) {
+		t.Fatalf("quoted identifier casing lost: %s", out)
+	}
+}
+
+// Table-valued functions must never be wrapped nor given empty aliases.
+func TestBughuntTableFunctions(t *testing.T) {
+	out := bughuntApply(t, "postgres", "select * from generate_series(1, 10) g join a on true")
+	if got := bughuntWraps(t, out, "postgres"); got != 1 {
+		t.Fatalf("want only physical table a wrapped, got %d: %s", got, out)
+	}
+}

@@ -66,6 +66,31 @@ type lineageOptions struct {
 // LineageOption configures LineageSourceColumns and ParseColumns.
 type LineageOption func(*lineageOptions)
 
+// lineageDialectAliases maps convenient dialect spellings to the token the
+// Polyglot analysis engine expects, so a value that parses but is rejected by
+// AnalyzeQuery (e.g. "postgres", which the analyzer expects as "postgresql")
+// does not surface as an ErrInternal. Dialects not listed here pass through
+// unchanged.
+var lineageDialectAliases = map[string]string{
+	"postgres":   "postgresql",
+	"postgresql": "postgresql",
+	"pg":         "postgresql",
+}
+
+// normalizeLineageDialect trims and lower-cases the configured dialect,
+// defaulting blank values to "trino" and translating known aliases to the
+// engine's expected token.
+func normalizeLineageDialect(dialect string) string {
+	d := strings.ToLower(strings.TrimSpace(dialect))
+	if d == "" {
+		return "trino"
+	}
+	if mapped, ok := lineageDialectAliases[d]; ok {
+		return mapped
+	}
+	return d
+}
+
 // WithLineageDialect selects the SQL dialect used to parse and analyze the
 // statement (e.g. "trino", "hive", "spark", "postgres", "mysql"). It defaults
 // to "trino".
@@ -170,9 +195,7 @@ func prepareLineage(client *polyglot.Client, sql string, opts ...LineageOption) 
 	for _, o := range opts {
 		o(&cfg)
 	}
-	if strings.TrimSpace(cfg.dialect) == "" {
-		cfg.dialect = "trino"
-	}
+	cfg.dialect = normalizeLineageDialect(cfg.dialect)
 	if strings.TrimSpace(cfg.producer) == "" {
 		cfg.producer = lineageProducer
 	}
@@ -247,18 +270,12 @@ func aggregateColumns(
 		return fmt.Errorf("%w: column lineage failed: %v", ErrInternal, err)
 	}
 
-	// Fold each output field into tableCols in a single pass:
-	//   - Resolved fields map to the source (table, column) pairs that produced
-	//     them, but only when the input table is in the query scope.
-	//   - Unresolved fields are usually a bare column that is ambiguous across
-	//     joined tables. sqllineage attributes such a column to every in-scope
-	//     candidate source table that declares it in metadata; when no in-scope
-	//     metadata declares it, every source table in scope is credited.
-	scopeTables := scopeTableNames(tableCols)
-	for name, field := range res.Facet.Fields {
+	// Fold each RESOLVED output field into tableCols: it maps to the source
+	// (table, column) pairs that produced it, when the input table is in scope.
+	sourceless := false
+	for _, field := range res.Facet.Fields {
 		if len(field.InputFields) == 0 {
-			creditUnresolvedColumn(name, cfg.metadata, scopeTables, tableCols)
-			continue
+			sourceless = true
 		}
 		for _, in := range field.InputFields {
 			if in.Name == "" || in.Field == "" {
@@ -271,37 +288,65 @@ func aggregateColumns(
 			ensureSet(tableCols, scope)[in.Field] = struct{}{}
 		}
 	}
+
+	// Some output fields come back with NO source column at all: count(*),
+	// literal projections, unqualified aggregate args the engine fails to
+	// resolve, scalar-subquery aliases. The engine only exposes their output
+	// NAME (an alias like "c" or a synthetic "_0"), which is not a source
+	// column. Rather than crediting that phantom name, recover the REAL source
+	// columns that flow into the result by resolving the leaf's projections
+	// structurally (recursing scalar subqueries, excluding filter positions).
+	if sourceless {
+		if err := creditFlowColumns(client, leafSQL, cfg, tableCols); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func scopeTableNames(tableCols map[string]map[string]struct{}) []string {
-	names := make([]string, 0, len(tableCols))
-	for t := range tableCols {
-		names = append(names, t)
-	}
-	sort.Strings(names)
-	return names
-}
-
-func creditUnresolvedColumn(
-	name string,
-	metadata map[string][]string,
-	scopeTables []string,
+// creditFlowColumns resolves leafSQL's projection flow structurally and folds
+// the columns that reach the result into tableCols. It is used to recover the
+// real source columns of output fields the engine returns with no source column
+// (count(*), literals, unqualified aggregates, scalar-subquery aliases), keyed
+// on the actual referenced column rather than the fabricated output name.
+func creditFlowColumns(
+	client *polyglot.Client,
+	leafSQL string,
+	cfg lineageOptions,
 	tableCols map[string]map[string]struct{},
-) {
-	var credited bool
-	for _, scope := range scopeTables {
-		if cols, ok := lookupMetadataColumns(metadata, scope); ok && containsString(cols, name) {
-			ensureSet(tableCols, scope)[name] = struct{}{}
-			credited = true
+) error {
+	stmt, err := parseFirstStatement(client, leafSQL, cfg.dialect)
+	if err != nil {
+		return err
+	}
+	inner := innerQuery(stmt)
+	if inner == nil {
+		return nil
+	}
+	q, err := decodeQueryMap(inner)
+	if err != nil {
+		return err
+	}
+
+	rr := &refResolver{metadata: cfg.metadata, result: map[string]map[string]struct{}{}, flowOnly: true}
+	out := rr.resolveQuery(q, nil)
+
+	// Record only the (table, column) refs that flow into the query's result.
+	// The "*" sentinel (an unexpandable star) is not a concrete column and is
+	// dropped, matching the engine's behavior for a wildcard without metadata.
+	for _, name := range out.names {
+		for _, ref := range out.byName[strings.ToLower(name)] {
+			if ref.table == "" || ref.col == "" || ref.col == "*" {
+				continue
+			}
+			scope, ok := resolveScopeTable(tableCols, ref.table)
+			if !ok {
+				continue
+			}
+			ensureSet(tableCols, scope)[ref.col] = struct{}{}
 		}
 	}
-	if credited {
-		return
-	}
-	for _, scope := range scopeTables {
-		ensureSet(tableCols, scope)[name] = struct{}{}
-	}
+	return nil
 }
 
 // resolveScopeTable maps an OpenLineage input dataset name to the fully-qualified
@@ -323,20 +368,23 @@ func resolveScopeTable(tableCols map[string]map[string]struct{}, inputName strin
 }
 
 func tableRefMatches(a, b string) bool {
-	if a == b {
+	return hasTableSuffix(a, b) || hasTableSuffix(b, a)
+}
+
+// hasTableSuffix reports whether the fully-qualified name `qualified` ends with
+// the table reference `ref` on a name-segment boundary: either the two are
+// equal, or `qualified` ends with ".ref". The dot-boundary check is what stops
+// a query table `raw.orders` from spuriously matching an unrelated catalog key
+// `hive.braw.orders` (schema "braw", not "raw"), which a plain strings.HasSuffix
+// would accept.
+func hasTableSuffix(qualified, ref string) bool {
+	if ref == "" {
+		return false
+	}
+	if qualified == ref {
 		return true
 	}
-	for _, pair := range [][2]string{{a, b}, {b, a}} {
-		ref, qualified := pair[0], pair[1]
-		suffix := ref
-		if !strings.Contains(ref, ".") {
-			suffix = "." + ref
-		}
-		if strings.HasSuffix(qualified, suffix) {
-			return true
-		}
-	}
-	return false
+	return strings.HasSuffix(qualified, "."+ref)
 }
 
 // metadataForSources returns the subset of metadata for tables the query reads.
@@ -366,14 +414,10 @@ func metadataKeyForTable(metadata map[string][]string, tableRef string) string {
 	if _, ok := metadata[tableRef]; ok {
 		return tableRef
 	}
-	suffix := tableRef
-	if !strings.Contains(tableRef, ".") {
-		suffix = "." + tableRef
-	}
 	var found string
 	var count int
 	for key := range metadata {
-		if key == tableRef || strings.HasSuffix(key, suffix) {
+		if hasTableSuffix(key, tableRef) {
 			found = key
 			count++
 		}
@@ -468,6 +512,16 @@ func innerQuery(stmt map[string]any) map[string]any {
 // rejects set operations directly, so each branch is analyzed on its own and the
 // results are merged.
 func leafSelects(node map[string]any) []map[string]any {
+	// A parenthesized set-operation branch parses as a subquery wrapping a
+	// query body (e.g. `A UNION (B UNION C)` puts `(B UNION C)` under a
+	// subquery node). Unwrap it so its nested set operation is split into its
+	// own leaves too; otherwise the whole nested union is handed to the engine,
+	// which rejects a set operation.
+	if sub, ok := node["subquery"].(map[string]any); ok {
+		if inner, ok := sub["this"].(map[string]any); ok && queryBody(inner) != nil {
+			return leafSelects(inner)
+		}
+	}
 	for _, k := range setOpKeys {
 		if so, ok := node[k].(map[string]any); ok {
 			var leaves []map[string]any
