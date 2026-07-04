@@ -1,6 +1,7 @@
 package easysql
 
 import (
+	"errors"
 	"reflect"
 	"sort"
 	"testing"
@@ -41,6 +42,16 @@ func TestReferencedColumnsIncludesFilterColumns(t *testing.T) {
 		`SELECT a FROM t WHERE b > 1`,
 		map[string][]string{"t": {"a", "b"}},
 	)
+}
+
+func TestReferencedColumnsRejectsMultipleStatements(t *testing.T) {
+	_, err := ReferencedColumns(
+		`SELECT a FROM t; SELECT secret FROM restricted`,
+		WithLineageDialect("trino"),
+	)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("ReferencedColumns error = %v, want ErrUnsupported", err)
+	}
 }
 
 // TestReferencedColumnsIsSupersetOfLineage pins the documented relationship:
@@ -153,6 +164,22 @@ func TestReferencedColumnsJoinUnqualifiedNoMetadataIsSuperset(t *testing.T) {
 			"a": {"k", "name", "status"},
 			"b": {"k", "name", "status"},
 		},
+	)
+}
+
+func TestReferencedColumnsFullyQualifiedSameBareTableName(t *testing.T) {
+	assertReferencedColumns(t, "fully_qualified_same_bare_table_name",
+		`SELECT hive.raw.users.id, hive.stage.users.email
+         FROM hive.raw.users
+         JOIN hive.stage.users ON hive.raw.users.id = hive.stage.users.id`,
+		map[string][]string{
+			"hive.raw.users":   {"id"},
+			"hive.stage.users": {"email", "id"},
+		},
+		WithLineageMetadata(map[string][]string{
+			"hive.raw.users":   {"id", "name"},
+			"hive.stage.users": {"id", "email"},
+		}),
 	)
 }
 
@@ -646,12 +673,6 @@ func TestReferencedColumnsMiscEdges(t *testing.T) {
 			dialect:  "trino",
 			sql:      `SELECT "Order" FROM t WHERE "User" > 1`,
 			expected: map[string][]string{"t": {"Order", "User"}},
-		},
-		{
-			name:     "first_of_multiple_statements",
-			dialect:  "trino",
-			sql:      `SELECT a FROM t; SELECT b FROM r`,
-			expected: map[string][]string{"t": {"a"}},
 		},
 		{
 			name:     "insert_target_columns_excluded",

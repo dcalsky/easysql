@@ -789,6 +789,9 @@ func (rr *refResolver) resolveQualified(qualifier, name string, ctx *scopeCtx) [
 				return refsForRoots(s.roots, name)
 			}
 		}
+		if refs := resolveQualifiedPhysical(qualifier, name, c); len(refs) > 0 {
+			return refs
+		}
 	}
 	// Unknown qualifier (alias we could not resolve): never drop — attribute to
 	// every physical source in scope and its parents (safe superset).
@@ -798,6 +801,22 @@ func (rr *refResolver) resolveQualified(qualifier, name string, ctx *scopeCtx) [
 	// No sources at all: surface the column under its written qualifier so it is
 	// not lost (last resort).
 	return []colRef{{qualifier, name}}
+}
+
+func resolveQualifiedPhysical(qualifier, name string, ctx *scopeCtx) []colRef {
+	var refs []colRef
+	seen := map[string]struct{}{}
+	for _, s := range physicalSources(ctx) {
+		if !tableRefMatches(qualifier, s.table) {
+			continue
+		}
+		if _, ok := seen[s.table]; ok {
+			continue
+		}
+		seen[s.table] = struct{}{}
+		refs = append(refs, colRef{s.table, name})
+	}
+	return refs
 }
 
 func (rr *refResolver) resolveUnqualified(name string, ctx *scopeCtx) []colRef {
@@ -1070,9 +1089,10 @@ func isQueryObj(obj map[string]expr) bool {
 	return has(obj, "select") || has(obj, "union") || has(obj, "intersect") || has(obj, "except")
 }
 
-// dotColumn extracts (column, immediate-table-qualifier) from a dot chain such
-// as catalog.schema.table.column. The outermost field is the column; the segment
-// directly before it is the table qualifier. node is the {"dot": …} wrapper.
+// dotColumn extracts (column, qualifier) from a dot chain such as
+// catalog.schema.table.column. The outermost field is the column; every segment
+// before it is the qualifier so fully-qualified references can disambiguate
+// tables with the same bare name. node is the {"dot": …} wrapper.
 func dotColumn(node expr) (col, qualifier string) {
 	segs := dotSegments(node)
 	if len(segs) == 0 {
@@ -1080,7 +1100,7 @@ func dotColumn(node expr) (col, qualifier string) {
 	}
 	col = segs[len(segs)-1]
 	if len(segs) >= 2 {
-		qualifier = segs[len(segs)-2]
+		qualifier = strings.Join(segs[:len(segs)-1], ".")
 	}
 	return col, qualifier
 }

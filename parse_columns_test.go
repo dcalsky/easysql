@@ -128,6 +128,11 @@ func assertParseColumnsError(t *testing.T, name, sql string, opts ...LineageOpti
 	}
 }
 
+func TestParseColumnsRejectsMultipleStatements(t *testing.T) {
+	assertParseColumnsError(t, "multiple_statements",
+		`SELECT a FROM t; SELECT secret FROM restricted`)
+}
+
 func TestParseColumnsRealViewBareAndQuotedAliasColumns(t *testing.T) {
 	assertParseColumns(t, "real_view_bare_and_quoted_alias_columns", realViewSQL, realViewExpected)
 }

@@ -512,8 +512,12 @@ func (r *rewriter) matches(v map[string]any) bool {
 	if r.byName[nameL] {
 		return true
 	}
+	fullName := name
+	if schemaW != "" {
+		fullName = identName(t["schema"]) + "." + name
+	}
 	for _, rx := range r.regexps {
-		if rx.MatchString(name) {
+		if rx.MatchString(name) || rx.MatchString(fullName) {
 			return true
 		}
 	}

@@ -166,6 +166,16 @@ func TestCTEScopeSecurity(t *testing.T) {
 	}
 }
 
+func TestTableRegexpMatchesQualifiedName(t *testing.T) {
+	rewriteValid(t, "mysql",
+		"select * from sales.orders join sales.users on orders.user_id = users.id",
+		testWhere,
+		testMarker,
+		1,
+		WithTableRegexp(`^sales\.orders$`),
+	)
+}
+
 // TestTableFunctionsNotWrapped: table-valued functions are not physical tables
 // and must be passed through unfiltered, never producing an empty alias.
 func TestTableFunctionsNotWrapped(t *testing.T) {

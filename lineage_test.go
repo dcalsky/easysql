@@ -1,6 +1,7 @@
 package easysql
 
 import (
+	"errors"
 	"reflect"
 	"sort"
 	"testing"
@@ -46,6 +47,16 @@ func assertLineageSourceColumns(t *testing.T, name, sql string, expected map[str
 	}
 	if !reflect.DeepEqual(actual, want) {
 		t.Fatalf("%s\nexpected: %v\nactual:   %v", name, want, actual)
+	}
+}
+
+func TestLineageSourceColumnsRejectsMultipleStatements(t *testing.T) {
+	_, err := LineageSourceColumns(
+		`SELECT a FROM t; SELECT secret FROM restricted`,
+		WithLineageDialect("trino"),
+	)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("LineageSourceColumns error = %v, want ErrUnsupported", err)
 	}
 }
 
@@ -373,7 +384,7 @@ func TestLineageEmptySourceMetadataIgnoresUnrelatedCatalogTables(t *testing.T) {
 func TestLineageEmptySourceMetadataCreditsOnlyQueriedTable(t *testing.T) {
 	metadata := map[string][]string{
 		"vdm_rda.launch_to_engage.event":            {},
-		"vdm_rda.launch_to_engage.event_attendance":  {"actual_end_time", "brand", "bu"},
+		"vdm_rda.launch_to_engage.event_attendance": {"actual_end_time", "brand", "bu"},
 		"vdm_rda_launch_to_engage.event1":           {"brand", "actual_a_hcp_count", "event_nm"},
 	}
 	assertLineageWithMetadata(t,
@@ -396,8 +407,8 @@ func TestLineageEmptySourceMetadataCreditsOnlyQueriedTable(t *testing.T) {
 // table key in the lineage result must be a base table the query actually reads.
 func TestLineageResultKeysAreQuerySourceTablesOnly(t *testing.T) {
 	metadata := map[string][]string{
-		"hive.raw.users":  {"user_id", "user_name"},
-		"hive.raw.orders": {"order_id", "user_id", "amount"},
+		"hive.raw.users":    {"user_id", "user_name"},
+		"hive.raw.orders":   {"order_id", "user_id", "amount"},
 		"hive.raw.payments": {"order_id", "paid_amount"},
 	}
 	sql := `SELECT user_id, amount FROM hive.raw.orders`
