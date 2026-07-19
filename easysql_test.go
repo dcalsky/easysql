@@ -491,6 +491,22 @@ func TestBughuntDuplicateAliasSameBareNameJoin(t *testing.T) {
 	}
 }
 
+func TestApplyRowFilterBareRebindIsScopedToEachQuery(t *testing.T) {
+	out, err := ApplyRowFilter(
+		`SELECT t.a FROM s1.t WHERE t.b IN (SELECT t.c FROM s2.t)`,
+		`x = 1`,
+		WithDialect("trino"),
+	)
+	if err != nil {
+		t.Fatalf("ApplyRowFilter: %v", err)
+	}
+
+	const want = "SELECT s1_t.a FROM (SELECT * FROM s1.t WHERE x = 1) AS s1_t WHERE s1_t.b IN (SELECT s2_t.c FROM (SELECT * FROM s2.t WHERE x = 1) AS s2_t)"
+	if out != want {
+		t.Fatalf("unexpected rewrite:\nwant: %s\n got: %s", want, out)
+	}
+}
+
 // A derived-table alias must not collide with a same-named CTE referenced in
 // the same FROM: a schema-qualified db.t is wrapped with a distinct alias so
 // the outer FROM does not bind two relations named `t`.

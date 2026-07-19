@@ -189,11 +189,10 @@ func RewriteTableReferences(sql string, specs []TableRewrite, opts ...RewriteTab
 		if err != nil {
 			return "", err
 		}
-		delete(m.node, "table")
-		m.node["subquery"] = sub
+		replaceTableWithSubquery(m.node, sub)
 	}
 
-	rebindColumnRefs(stmts[0], rebindCtx)
+	rebindColumnRefs(stmts[0], rebindCtx, matches)
 
 	// Drop comments so the regenerated SQL cannot carry stale commented-out text
 	// or leak intent the caller placed in comments. Comments were separated out
@@ -297,15 +296,23 @@ type tableMatch struct {
 	table map[string]any // node["table"]
 	spec  compiledTableRewrite
 
-	// Identity as written (lower-cased), used to match column references.
-	nameL    string
-	schemaL  string
-	catalogL string
+	// Identity as written, normalized per SQL folding rules (quoted exact,
+	// unquoted lower-cased), used to match column references. Normalizing --
+	// rather than blanket lower-casing -- keeps case-distinct quoted tables
+	// (postgres "MyTable" vs mytable) apart so they get distinct aliases.
+	nameNorm    string
+	schemaNorm  string
+	catalogNorm string
+
+	// nameL is the lower-cased bare table name used to match single-segment
+	// column qualifiers (table.col). Always folded for lookup regardless of
+	// quoting on the table reference itself.
+	nameL string
 
 	// hasAlias records whether the reference carried an explicit alias, in
 	// which case identity is "" and column references need no rebinding.
 	hasAlias bool
-	identity string // "catalog\x00schema\x00name" (lower) for unaliased tables
+	identity string // "catalog\x00schema\x00name" (normalized) for unaliased tables
 
 	// alias is the derived-table alias, assigned by assignDerivedAliases.
 	alias aliasRef
@@ -313,18 +320,19 @@ type tableMatch struct {
 
 func newTableMatch(node, table map[string]any, spec compiledTableRewrite) *tableMatch {
 	m := &tableMatch{
-		node:     node,
-		table:    table,
-		spec:     spec,
-		nameL:    strings.ToLower(identName(table["name"])),
-		schemaL:  strings.ToLower(identName(table["schema"])),
-		catalogL: strings.ToLower(identName(table["catalog"])),
+		node:        node,
+		table:       table,
+		spec:        spec,
+		nameNorm:    identNorm(table["name"]),
+		schemaNorm:  identNorm(table["schema"]),
+		catalogNorm: identNorm(table["catalog"]),
+		nameL:       strings.ToLower(identName(table["name"])),
 	}
 	if a, ok := table["alias"].(map[string]any); ok && a != nil {
 		m.hasAlias = true
 		m.alias = aliasRef{name: identName(a), quoted: identQuoted(a)}
 	} else {
-		m.identity = m.catalogL + "\x00" + m.schemaL + "\x00" + m.nameL
+		m.identity = m.catalogNorm + "\x00" + m.schemaNorm + "\x00" + m.nameNorm
 	}
 	return m
 }
@@ -340,26 +348,32 @@ func (m *tableMatch) defaultAlias() aliasRef {
 }
 
 // claimedQualifiers lists the multi-segment column-reference qualifiers
-// (lower-cased) that unambiguously resolve to this unaliased table: schema.table
+// (normalized) that unambiguously resolve to this unaliased table: schema.table
 // and, when written, catalog.schema.table. The bare name is intentionally
 // excluded -- a single-segment qualifier is scope-sensitive and either already
 // matches the derived alias or denotes a different relation.
 func (m *tableMatch) claimedQualifiers() [][]string {
-	if m.schemaL == "" {
+	if m.schemaNorm == "" {
 		return nil
 	}
-	quals := [][]string{{m.schemaL, m.nameL}}
-	if m.catalogL != "" {
-		quals = append(quals, []string{m.catalogL, m.schemaL, m.nameL})
+	schemaKey := identNorm(m.table["schema"])
+	tableKey := m.nameNorm
+	if !identQuoted(m.table["name"]) {
+		tableKey = m.nameL
+	}
+	quals := [][]string{{schemaKey, tableKey}}
+	if m.catalogNorm != "" {
+		catalogKey := identNorm(m.table["catalog"])
+		quals = append(quals, []string{catalogKey, schemaKey, tableKey})
 	}
 	return quals
 }
 
 func (m *tableMatch) buildSubquery(client *polyglot.Client, pg string) (map[string]any, error) {
 	if m.spec.inline != nil {
-		return buildInlineSubquery(client, pg, *m.spec.inline, m.alias)
+		return buildInlineSubquery(client, pg, *m.spec.inline, m.alias, m.table)
 	}
-	return buildUnionSubquery(client, pg, *m.spec.union, m.alias)
+	return buildUnionSubquery(client, pg, *m.spec.union, m.alias, m.table)
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +482,8 @@ func disambiguateAlias(identity string, def aliasRef, used map[string]bool) alia
 }
 
 // relationEntryName returns the lower-case relation name bound by a FROM/JOIN
-// entry (physical table or derived table). Projection aliases are ignored.
+// entry (physical table, derived table, UNNEST, table-valued function, …).
+// Projection aliases are ignored.
 func relationEntryName(entry map[string]any) (string, bool) {
 	if tbl, ok := entry["table"].(map[string]any); ok && tbl != nil {
 		if a, ok := tbl["alias"].(map[string]any); ok && a != nil {
@@ -485,7 +500,30 @@ func relationEntryName(entry map[string]any) (string, bool) {
 			return strings.ToLower(n), true
 		}
 	}
+	if aliasWrap, ok := entry["alias"].(map[string]any); ok && aliasWrap != nil {
+		if a, ok := aliasWrap["alias"].(map[string]any); ok && a != nil {
+			if n := identName(a); n != "" {
+				return strings.ToLower(n), true
+			}
+		}
+	}
+	for _, k := range []string{"unnest", "lateral", "table_function"} {
+		if rel, ok := entry[k].(map[string]any); ok && rel != nil {
+			if n := relationAliasName(rel); n != "" {
+				return strings.ToLower(n), true
+			}
+		}
+	}
 	return "", false
+}
+
+// relationAliasName returns the alias identifier on a relation node that carries
+// its alias directly (UNNEST, table functions, …).
+func relationAliasName(rel map[string]any) string {
+	if a, ok := rel["alias"].(map[string]any); ok && a != nil {
+		return identName(a)
+	}
+	return ""
 }
 
 func fromJoinEntries(body map[string]any) []map[string]any {
@@ -698,33 +736,111 @@ func walkWithQueryRelations(node any, cteScope []map[string]bool, queryRelations
 // ---------------------------------------------------------------------------
 
 // rebindContext carries qualified and bare-name rebinding rules for rewritten
-// unaliased tables.
+// unaliased tables. Qualified rules are global for unique keys; bare rules are
+// filled per query scope.
 type rebindContext struct {
 	qualified map[string]aliasRef
 	bare      map[string]aliasRef
+	matches   []*tableMatch
 }
 
 func buildRebindContext(matches []*tableMatch) rebindContext {
-	qualified := map[string]aliasRef{}
-	bare := map[string]aliasRef{}
+	return rebindContext{qualified: map[string]aliasRef{}, matches: matches}
+}
+
+// qualifiedRebindForScope builds schema-/catalog-qualified rebinding rules for
+// one SELECT scope. Keys that would map to several distinct matches in the
+// same scope are omitted (callers must use the assigned alias instead).
+func qualifiedRebindForScope(body map[string]any, matches []*tableMatch, global map[string]aliasRef) map[string]aliasRef {
+	qualified := maps.Clone(global)
+	if body == nil {
+		return qualified
+	}
+	entries := fromJoinEntries(body)
+	keyCount := map[string]int{}
 	for _, m := range matches {
 		if m.hasAlias {
 			continue
 		}
-		for _, q := range m.claimedQualifiers() {
-			qualified[strings.Join(q, "\x00")] = m.alias
-		}
-		if strings.ToLower(m.alias.name) != m.nameL {
-			bare[m.nameL] = m.alias
+		for _, entry := range entries {
+			if !sameASTMap(m.node, entry) {
+				continue
+			}
+			for _, q := range m.claimedQualifiers() {
+				keyCount[strings.Join(q, "\x00")]++
+			}
+			break
 		}
 	}
-	return rebindContext{qualified: qualified, bare: bare}
+	for _, m := range matches {
+		if m.hasAlias {
+			continue
+		}
+		for _, entry := range entries {
+			if !sameASTMap(m.node, entry) {
+				continue
+			}
+			for _, q := range m.claimedQualifiers() {
+				key := strings.Join(q, "\x00")
+				if keyCount[key] == 1 {
+					qualified[key] = m.alias
+				} else {
+					delete(qualified, key)
+				}
+			}
+			break
+		}
+	}
+	return qualified
+}
+
+// bareRebindForScope builds the bare-name rebinding map for one SELECT body's
+// FROM/JOIN scope: only matches whose table reference lives in that scope.
+// When several distinct tables in the same scope share a lower-cased bare
+// name (e.g. postgres "MyTable" vs mytable), bare rebinding is omitted so
+// callers must use schema-qualified refs instead.
+func bareRebindForScope(body map[string]any, matches []*tableMatch) map[string]aliasRef {
+	bare := map[string]aliasRef{}
+	if body == nil {
+		return bare
+	}
+	entries := fromJoinEntries(body)
+	nameLInScope := map[string]int{}
+	for _, m := range matches {
+		if m.hasAlias {
+			continue
+		}
+		for _, entry := range entries {
+			if sameASTMap(m.node, entry) {
+				nameLInScope[m.nameL]++
+				break
+			}
+		}
+	}
+	for _, m := range matches {
+		if m.hasAlias {
+			continue
+		}
+		if nameLInScope[m.nameL] != 1 {
+			continue
+		}
+		for _, entry := range entries {
+			if !sameASTMap(m.node, entry) {
+				continue
+			}
+			if strings.ToLower(m.alias.name) != m.nameL {
+				bare[m.nameL] = m.alias
+			}
+			break
+		}
+	}
+	return bare
 }
 
 // identInfo is one identifier in a flattened column reference.
 type identInfo struct {
-	node  map[string]any
-	nameL string
+	node map[string]any
+	key  string // comparison key: exact for quoted, lower-cased otherwise
 }
 
 // refChain flattens a column/dot reference into its ordered identifier
@@ -744,18 +860,18 @@ func refChain(node map[string]any) ([]identInfo, bool) {
 		if !ok {
 			return nil, false
 		}
-		return append(chain, identInfo{node: field, nameL: strings.ToLower(identName(field))}), true
+		return append(chain, identInfo{node: field, key: identNorm(field)}), true
 	}
 	if col, ok := node["column"].(map[string]any); ok {
 		var chain []identInfo
 		if tbl, ok := col["table"].(map[string]any); ok && tbl != nil {
-			chain = append(chain, identInfo{node: tbl, nameL: strings.ToLower(identName(tbl))})
+			chain = append(chain, identInfo{node: tbl, key: identNorm(tbl)})
 		}
 		name, ok := col["name"].(map[string]any)
 		if !ok {
 			return nil, false
 		}
-		chain = append(chain, identInfo{node: name, nameL: strings.ToLower(identName(name))})
+		chain = append(chain, identInfo{node: name, key: identNorm(name)})
 		return chain, true
 	}
 	return nil, false
@@ -763,7 +879,8 @@ func refChain(node map[string]any) ([]identInfo, bool) {
 
 // rebindColumnRefs walks the statement and rewrites column references that must
 // point at a derived-table alias after the rewrite.
-func rebindColumnRefs(stmt any, ctx rebindContext) {
+func rebindColumnRefs(stmt any, ctx rebindContext, matches []*tableMatch) {
+	ctx.matches = matches
 	if m, ok := stmt.(map[string]any); ok {
 		if body := queryBody(m); body != nil {
 			rebindQuery(body, nil, ctx)
@@ -782,8 +899,12 @@ func rebindQuery(body map[string]any, cteScope []map[string]bool, ctx rebindCont
 		return
 	}
 
+	scopeCtx := ctx
+	scopeCtx.bare = bareRebindForScope(body, ctx.matches)
+	scopeCtx.qualified = qualifiedRebindForScope(body, ctx.matches, ctx.qualified)
+
 	newScope := extendScopeWithCTEs(body, cteScope, func(n any, scope []map[string]bool) {
-		rebindNode(n, scope, ctx)
+		rebindNode(n, scope, scopeCtx)
 	})
 	// relations is the set of bare names that already resolve to something in
 	// this query scope, so a bare `name.col` ref must NOT be rebound onto a
@@ -798,7 +919,7 @@ func rebindQuery(body map[string]any, cteScope []map[string]bool, ctx rebindCont
 	// for disambiguation, silently changing which relation the query reads.
 	relations := collectFromRelationNames(body)
 	rebindWithRelations := func(node any) {
-		rebindNodeWithRelations(node, newScope, relations, ctx)
+		rebindNodeWithRelations(node, newScope, relations, scopeCtx)
 	}
 	rebindWithRelations(body["hint"])
 	rebindWithRelations(body["expressions"])
@@ -889,7 +1010,7 @@ func tryRebindRefAtScope(v map[string]any, ctx rebindContext, relations map[stri
 
 	qualParts := make([]string, len(chain)-1)
 	for i, q := range chain[:len(chain)-1] {
-		qualParts[i] = q.nameL
+		qualParts[i] = q.key
 	}
 	a, matched := lookupRebindAlias(qualParts, ctx, relations)
 	if !matched {
@@ -929,11 +1050,19 @@ func tryRebindStarAtScope(v map[string]any, ctx rebindContext, relations map[str
 }
 
 // starQualifierParts splits the lower-cased qualifier segments of a star node.
-// An unqualified SELECT * yields ok=false.
+// An unqualified SELECT * yields ok=false. Quoted identifiers are one segment
+// even when the name contains dots.
 func starQualifierParts(star map[string]any) ([]string, bool) {
 	tbl, ok := star["table"].(map[string]any)
 	if !ok || tbl == nil {
 		return nil, false
+	}
+	if identQuoted(tbl) {
+		name := identName(tbl)
+		if name == "" {
+			return nil, false
+		}
+		return []string{identNorm(tbl)}, true
 	}
 	name := identName(tbl)
 	if name == "" {
@@ -982,7 +1111,7 @@ var (
 )
 
 // buildInlineSubquery builds the AST for (SELECT * FROM <target>) AS <alias>.
-func buildInlineSubquery(client *polyglot.Client, pg string, target TableRef, alias aliasRef) (map[string]any, error) {
+func buildInlineSubquery(client *polyglot.Client, pg string, target TableRef, alias aliasRef, origTable map[string]any) (map[string]any, error) {
 	sub, err := parseSubqueryWrapper(client, pg, "SELECT * FROM __ez_t0__")
 	if err != nil {
 		return nil, err
@@ -991,12 +1120,13 @@ func buildInlineSubquery(client *polyglot.Client, pg string, target TableRef, al
 		return nil, err
 	}
 	sub["alias"] = newIdent(alias.name, alias.quoted)
+	attachSubqueryColumnAliases(sub, origTable)
 	return sub, nil
 }
 
 // buildUnionSubquery builds the AST for
 // (SELECT <cols> FROM <branch0> UNION DISTINCT SELECT <cols> FROM <branch1> ...) AS <alias>.
-func buildUnionSubquery(client *polyglot.Client, pg string, spec UnionRewrite, alias aliasRef) (map[string]any, error) {
+func buildUnionSubquery(client *polyglot.Client, pg string, spec UnionRewrite, alias aliasRef, origTable map[string]any) (map[string]any, error) {
 	colPlaceholders := make([]string, len(spec.Columns))
 	for j := range spec.Columns {
 		colPlaceholders[j] = fmt.Sprintf("__ez_c%d__", j)
@@ -1017,7 +1147,52 @@ func buildUnionSubquery(client *polyglot.Client, pg string, spec UnionRewrite, a
 		return nil, err
 	}
 	sub["alias"] = newIdent(alias.name, alias.quoted)
+	attachSubqueryColumnAliases(sub, origTable)
 	return sub, nil
+}
+
+// attachSubqueryColumnAliases copies AS alias (col, …) metadata from a physical
+// table reference onto a derived-table subquery node.
+func attachSubqueryColumnAliases(sub, origTable map[string]any) {
+	if origTable == nil || sub == nil {
+		return
+	}
+	cols, ok := origTable["column_aliases"].([]any)
+	if !ok || len(cols) == 0 {
+		return
+	}
+	sub["column_aliases"] = deepCopyJSON(cols)
+	if v, ok := origTable["alias_explicit_as"]; ok {
+		sub["alias_explicit_as"] = v
+	}
+	if v, ok := origTable["alias_keyword"]; ok {
+		sub["alias_keyword"] = v
+	}
+}
+
+// replaceTableWithSubquery swaps a FROM entry's physical table for a derived
+// table, preserving TABLESAMPLE and any other sibling fields on the entry.
+func replaceTableWithSubquery(entry, sub map[string]any) {
+	var tableSample any
+	if tbl, ok := entry["table"].(map[string]any); ok && tbl != nil {
+		if s, ok := tbl["table_sample"]; ok {
+			tableSample = deepCopyJSON(s)
+		}
+	}
+	delete(entry, "table")
+	entry["subquery"] = sub
+	if tableSample == nil {
+		return
+	}
+	if inner, ok := dig(sub, "this", "select", "from", "expressions"); ok {
+		if list, ok := inner.([]any); ok && len(list) > 0 {
+			if innerEntry, ok := list[0].(map[string]any); ok {
+				if innerTbl, ok := innerEntry["table"].(map[string]any); ok {
+					innerTbl["table_sample"] = tableSample
+				}
+			}
+		}
+	}
 }
 
 // parseSubqueryWrapper parses "SELECT * FROM (<innerSQL>) AS <ph>" and returns
@@ -1149,6 +1324,23 @@ func identQuoted(v any) bool {
 		}
 	}
 	return false
+}
+
+// normName returns the comparison key for an identifier: SQL folds only
+// unquoted identifiers, so quoted ones compare exactly and unquoted ones
+// case-insensitively. Two references that normalize differently are treated as
+// distinct relations (over-splitting is safe -- both still get rewritten --
+// while merging case-distinct quoted tables would emit duplicate aliases).
+func normName(name string, quoted bool) string {
+	if quoted {
+		return name
+	}
+	return strings.ToLower(name)
+}
+
+// identNorm returns normName for an identifier AST node.
+func identNorm(v any) string {
+	return normName(identName(v), identQuoted(v))
 }
 
 // stripASTComments empties every comment attachment on the AST (the parser
