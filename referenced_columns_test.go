@@ -35,6 +35,28 @@ func assertReferencedColumns(t *testing.T, name, sql string, expected map[string
 	}
 }
 
+func assertReferencedColumnUsages(t *testing.T, name, sql string, expected []ColumnUse, opts ...LineageOption) {
+	t.Helper()
+	opts = append([]LineageOption{WithLineageDialect("trino")}, opts...)
+	actual, err := ReferencedColumnUsages(sql, opts...)
+	if err != nil {
+		t.Fatalf("%s: ReferencedColumnUsages: %v", name, err)
+	}
+	want := append([]ColumnUse{}, expected...)
+	sort.Slice(want, func(i, j int) bool {
+		if want[i].Table != want[j].Table {
+			return want[i].Table < want[j].Table
+		}
+		if want[i].Column != want[j].Column {
+			return want[i].Column < want[j].Column
+		}
+		return want[i].Clause < want[j].Clause
+	})
+	if !reflect.DeepEqual(actual, want) {
+		t.Fatalf("%s\nexpected usages: %v\nactual usages:   %v", name, want, actual)
+	}
+}
+
 // --------------------------------------------------------------------------- //
 // Core semantics: filter-position columns are INCLUDED (the whole point).
 // --------------------------------------------------------------------------- //
@@ -47,12 +69,14 @@ func TestReferencedColumnsIncludesFilterColumns(t *testing.T) {
 }
 
 func TestReferencedColumnsRejectsMultipleStatements(t *testing.T) {
-	_, err := ReferencedColumns(
-		`SELECT a FROM t; SELECT secret FROM restricted`,
-		WithLineageDialect("trino"),
-	)
+	sql := `SELECT a FROM t; SELECT secret FROM restricted`
+	_, err := ReferencedColumns(sql, WithLineageDialect("trino"))
 	if !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("ReferencedColumns error = %v, want ErrUnsupported", err)
+	}
+	_, err = ReferencedColumnUsages(sql, WithLineageDialect("trino"))
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("ReferencedColumnUsages error = %v, want ErrUnsupported", err)
 	}
 }
 
@@ -80,36 +104,112 @@ func TestReferencedColumnsAllFilterPositions(t *testing.T) {
 		name     string
 		sql      string
 		expected map[string][]string
+		usages   []ColumnUse
 	}{
 		{
 			name:     "where",
 			sql:      `SELECT a FROM t WHERE b > 1`,
 			expected: map[string][]string{"t": {"a", "b"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "b", Clause: ColumnClauseWhere},
+			},
 		},
 		{
 			name:     "group_by",
 			sql:      `SELECT a, count(*) FROM t GROUP BY a, g`,
 			expected: map[string][]string{"t": {"a", "g"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "a", Clause: ColumnClauseGroupBy},
+				{Table: "t", Column: "g", Clause: ColumnClauseGroupBy},
+			},
+		},
+		{
+			name:     "group_by_projection_alias",
+			sql:      `SELECT a + b AS x FROM t GROUP BY x`,
+			expected: map[string][]string{"t": {"a", "b"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "a", Clause: ColumnClauseGroupBy},
+				{Table: "t", Column: "b", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "b", Clause: ColumnClauseGroupBy},
+			},
+		},
+		{
+			name:     "group_by_ordinal",
+			sql:      `SELECT a, b FROM t GROUP BY 1, b`,
+			expected: map[string][]string{"t": {"a", "b"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "a", Clause: ColumnClauseGroupBy},
+				{Table: "t", Column: "b", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "b", Clause: ColumnClauseGroupBy},
+			},
 		},
 		{
 			name:     "having",
 			sql:      `SELECT a FROM t GROUP BY a HAVING sum(h) > 1`,
 			expected: map[string][]string{"t": {"a", "h"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "a", Clause: ColumnClauseGroupBy},
+				{Table: "t", Column: "h", Clause: ColumnClauseHaving},
+			},
 		},
 		{
 			name:     "order_by",
 			sql:      `SELECT a FROM t ORDER BY o`,
 			expected: map[string][]string{"t": {"a", "o"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "o", Clause: ColumnClauseOrderBy},
+			},
+		},
+		{
+			name:     "order_by_projection_alias",
+			sql:      `SELECT a AS x FROM t ORDER BY x`,
+			expected: map[string][]string{"t": {"a"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "a", Clause: ColumnClauseOrderBy},
+			},
+		},
+		{
+			name:     "order_by_numeric_expression_is_not_ordinal",
+			sql:      `SELECT a, b FROM t ORDER BY b + 1`,
+			expected: map[string][]string{"t": {"a", "b"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "b", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "b", Clause: ColumnClauseOrderBy},
+			},
 		},
 		{
 			name:     "window_partition_and_order",
 			sql:      `SELECT a, row_number() OVER (PARTITION BY b ORDER BY c) rn FROM t`,
 			expected: map[string][]string{"t": {"a", "b", "c"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "b", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "c", Clause: ColumnClauseSelect},
+			},
+		},
+		{
+			name:     "named_window_clause",
+			sql:      `SELECT sum(a) OVER w FROM t WINDOW w AS (PARTITION BY p ORDER BY o)`,
+			expected: map[string][]string{"t": {"a", "o", "p"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "p", Clause: ColumnClauseWindow},
+				{Table: "t", Column: "o", Clause: ColumnClauseWindow},
+			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			assertReferencedColumns(t, tc.name, tc.sql, tc.expected)
+			assertReferencedColumnUsages(t, tc.name, tc.sql, tc.usages)
 		})
 	}
 }
@@ -117,11 +217,91 @@ func TestReferencedColumnsAllFilterPositions(t *testing.T) {
 // QUALIFY is not parsed by the Trino dialect, so this clause is covered under a
 // dialect that supports it (Snowflake). Resolution is dialect-agnostic.
 func TestReferencedColumnsQualifyClause(t *testing.T) {
-	assertReferencedColumns(t, "qualify",
-		`SELECT a FROM t QUALIFY row_number() OVER (PARTITION BY p ORDER BY q) = 1`,
-		map[string][]string{"t": {"a", "p", "q"}},
-		WithLineageDialect("snowflake"),
-	)
+	t.Run("inline_expression", func(t *testing.T) {
+		sql := `SELECT a FROM t QUALIFY row_number() OVER (PARTITION BY p ORDER BY q) = 1`
+		assertReferencedColumns(t, "qualify", sql,
+			map[string][]string{"t": {"a", "p", "q"}},
+			WithLineageDialect("snowflake"),
+		)
+		assertReferencedColumnUsages(t, "qualify", sql,
+			[]ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "p", Clause: ColumnClauseQualify},
+				{Table: "t", Column: "q", Clause: ColumnClauseQualify},
+			},
+			WithLineageDialect("snowflake"),
+		)
+	})
+	t.Run("projection_alias", func(t *testing.T) {
+		sql := `SELECT a, row_number() OVER (PARTITION BY p ORDER BY q) AS rn FROM t QUALIFY rn = 1`
+		assertReferencedColumns(t, "qualify_alias", sql,
+			map[string][]string{"t": {"a", "p", "q"}},
+			WithLineageDialect("snowflake"),
+		)
+		assertReferencedColumnUsages(t, "qualify_alias", sql,
+			[]ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "p", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "p", Clause: ColumnClauseQualify},
+				{Table: "t", Column: "q", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "q", Clause: ColumnClauseQualify},
+			},
+			WithLineageDialect("snowflake"),
+		)
+	})
+}
+
+func TestReferencedColumnUsagesDialectClauses(t *testing.T) {
+	cases := []struct {
+		name    string
+		dialect string
+		sql     string
+		column  string
+		clause  ColumnClause
+	}{
+		{
+			name:    "sort_by",
+			dialect: "spark",
+			sql:     `SELECT a FROM t SORT BY s`,
+			column:  "s",
+			clause:  ColumnClauseSortBy,
+		},
+		{
+			name:    "distribute_by",
+			dialect: "spark",
+			sql:     `SELECT a FROM t DISTRIBUTE BY d`,
+			column:  "d",
+			clause:  ColumnClauseDistributeBy,
+		},
+		{
+			name:    "cluster_by",
+			dialect: "spark",
+			sql:     `SELECT a FROM t CLUSTER BY c`,
+			column:  "c",
+			clause:  ColumnClauseClusterBy,
+		},
+		{
+			name:    "connect_by",
+			dialect: "oracle",
+			sql:     `SELECT a FROM t CONNECT BY PRIOR id = parent_id`,
+			column:  "id",
+			clause:  ColumnClauseConnectBy,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			expected := []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: tc.column, Clause: tc.clause},
+			}
+			if tc.name == "connect_by" {
+				expected = append(expected,
+					ColumnUse{Table: "t", Column: "parent_id", Clause: ColumnClauseConnectBy})
+			}
+			assertReferencedColumnUsages(t, tc.name, tc.sql, expected,
+				WithLineageDialect(tc.dialect))
+		})
+	}
 }
 
 // --------------------------------------------------------------------------- //
@@ -129,15 +309,25 @@ func TestReferencedColumnsQualifyClause(t *testing.T) {
 // --------------------------------------------------------------------------- //
 
 func TestReferencedColumnsJoinQualified(t *testing.T) {
-	assertReferencedColumns(t, "join_qualified",
-		`SELECT u.name
+	sql := `SELECT u.name
          FROM hive.raw.users u
          JOIN hive.raw.orders o ON u.id = o.uid
          WHERE o.status = 'X'
-         GROUP BY u.name`,
+         GROUP BY u.name`
+	assertReferencedColumns(t, "join_qualified", sql,
 		map[string][]string{
 			"hive.raw.users":  {"id", "name"},
 			"hive.raw.orders": {"status", "uid"},
+		},
+		WithLineageMetadata(refColsMetadata),
+	)
+	assertReferencedColumnUsages(t, "join_qualified", sql,
+		[]ColumnUse{
+			{Table: "hive.raw.users", Column: "name", Clause: ColumnClauseSelect},
+			{Table: "hive.raw.users", Column: "name", Clause: ColumnClauseGroupBy},
+			{Table: "hive.raw.users", Column: "id", Clause: ColumnClauseJoinOn},
+			{Table: "hive.raw.orders", Column: "uid", Clause: ColumnClauseJoinOn},
+			{Table: "hive.raw.orders", Column: "status", Clause: ColumnClauseWhere},
 		},
 		WithLineageMetadata(refColsMetadata),
 	)
@@ -201,11 +391,17 @@ func TestReferencedColumnsCTE(t *testing.T) {
 		name     string
 		sql      string
 		expected map[string][]string
+		usages   []ColumnUse
 	}{
 		{
 			name:     "single_cte_with_filter",
 			sql:      `WITH c AS (SELECT a, b FROM t) SELECT c.a FROM c WHERE c.b > 1`,
 			expected: map[string][]string{"t": {"a", "b"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "b", Clause: ColumnClauseSelect},
+				{Table: "t", Column: "b", Clause: ColumnClauseWhere},
+			},
 		},
 		{
 			name:     "cte_internal_filter",
@@ -236,6 +432,9 @@ func TestReferencedColumnsCTE(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			assertReferencedColumns(t, tc.name, tc.sql, tc.expected)
+			if tc.usages != nil {
+				assertReferencedColumnUsages(t, tc.name, tc.sql, tc.usages)
+			}
 		})
 	}
 }
@@ -249,6 +448,7 @@ func TestReferencedColumnsSubqueries(t *testing.T) {
 		name     string
 		sql      string
 		expected map[string][]string
+		usages   []ColumnUse
 	}{
 		{
 			name:     "derived_table_in_from",
@@ -259,6 +459,15 @@ func TestReferencedColumnsSubqueries(t *testing.T) {
 			name:     "scalar_subquery_in_select",
 			sql:      `SELECT a, (SELECT max(x) FROM r) m FROM t`,
 			expected: map[string][]string{"t": {"a"}, "r": {"x"}},
+		},
+		{
+			name:     "scalar_subquery_projection_alias_in_order_by",
+			sql:      `SELECT (SELECT max(x) FROM r) AS m FROM t ORDER BY m`,
+			expected: map[string][]string{"t": {}, "r": {"x"}},
+			usages: []ColumnUse{
+				{Table: "r", Column: "x", Clause: ColumnClauseSelect},
+				{Table: "r", Column: "x", Clause: ColumnClauseOrderBy},
+			},
 		},
 		{
 			name:     "in_subquery",
@@ -289,6 +498,9 @@ func TestReferencedColumnsSubqueries(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			assertReferencedColumns(t, tc.name, tc.sql, tc.expected)
+			if tc.usages != nil {
+				assertReferencedColumnUsages(t, tc.name, tc.sql, tc.usages)
+			}
 		})
 	}
 }
@@ -343,9 +555,18 @@ func TestReferencedColumnsStar(t *testing.T) {
 		)
 	})
 	t.Run("bare_star_with_metadata", func(t *testing.T) {
-		assertReferencedColumns(t, "bare_star_with_metadata",
-			`SELECT * FROM hive.raw.users WHERE id > 0`,
+		sql := `SELECT * FROM hive.raw.users WHERE id > 0`
+		assertReferencedColumns(t, "bare_star_with_metadata", sql,
 			map[string][]string{"hive.raw.users": {"email", "id", "name"}},
+			WithLineageMetadata(refColsMetadata),
+		)
+		assertReferencedColumnUsages(t, "bare_star_with_metadata", sql,
+			[]ColumnUse{
+				{Table: "hive.raw.users", Column: "id", Clause: ColumnClauseSelect},
+				{Table: "hive.raw.users", Column: "name", Clause: ColumnClauseSelect},
+				{Table: "hive.raw.users", Column: "email", Clause: ColumnClauseSelect},
+				{Table: "hive.raw.users", Column: "id", Clause: ColumnClauseWhere},
+			},
 			WithLineageMetadata(refColsMetadata),
 		)
 	})
@@ -434,10 +655,11 @@ func TestReferencedColumnsDDLWrappers(t *testing.T) {
 // --------------------------------------------------------------------------- //
 
 func TestReferencedColumnsTableWithNoColumnsStillAppears(t *testing.T) {
-	assertReferencedColumns(t, "select_constant",
-		`SELECT 1 FROM t`,
+	sql := `SELECT 1 FROM t`
+	assertReferencedColumns(t, "select_constant", sql,
 		map[string][]string{"t": {}},
 	)
+	assertReferencedColumnUsages(t, "select_constant", sql, []ColumnUse{})
 }
 
 func TestReferencedColumnsNonQueryStatementsAreEmpty(t *testing.T) {
@@ -451,6 +673,13 @@ func TestReferencedColumnsNonQueryStatementsAreEmpty(t *testing.T) {
 		}
 		if len(got) != 0 {
 			t.Fatalf("ReferencedColumns(%q) = %v; want empty", sql, got)
+		}
+		usages, err := ReferencedColumnUsages(sql, WithLineageDialect("trino"))
+		if err != nil {
+			t.Fatalf("ReferencedColumnUsages(%q): %v", sql, err)
+		}
+		if len(usages) != 0 {
+			t.Fatalf("ReferencedColumnUsages(%q) = %v; want empty", sql, usages)
 		}
 	}
 }
@@ -516,10 +745,16 @@ func TestReferencedColumnsFromConstructs(t *testing.T) {
 	t.Run("using_columns_included", func(t *testing.T) {
 		// USING (k) reads k from both joined tables; with no metadata the
 		// unqualified projection column a is also attributed to both (superset).
-		assertReferencedColumns(t, "using",
-			`SELECT a FROM t JOIN r USING (k)`,
+		sql := `SELECT a FROM t JOIN r USING (k)`
+		assertReferencedColumns(t, "using", sql,
 			map[string][]string{"t": {"a", "k"}, "r": {"a", "k"}},
 		)
+		assertReferencedColumnUsages(t, "using", sql, []ColumnUse{
+			{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+			{Table: "r", Column: "a", Clause: ColumnClauseSelect},
+			{Table: "t", Column: "k", Clause: ColumnClauseJoinUsing},
+			{Table: "r", Column: "k", Clause: ColumnClauseJoinUsing},
+		})
 	})
 	t.Run("self_join", func(t *testing.T) {
 		assertReferencedColumns(t, "self_join",
@@ -528,10 +763,14 @@ func TestReferencedColumnsFromConstructs(t *testing.T) {
 		)
 	})
 	t.Run("unnest_reads_source_column", func(t *testing.T) {
-		assertReferencedColumns(t, "unnest",
-			`SELECT i FROM t, UNNEST(t.arr) AS x(i)`,
+		sql := `SELECT i FROM t, UNNEST(t.arr) AS x(i)`
+		assertReferencedColumns(t, "unnest", sql,
 			map[string][]string{"t": {"arr", "i"}},
 		)
+		assertReferencedColumnUsages(t, "unnest", sql, []ColumnUse{
+			{Table: "t", Column: "arr", Clause: ColumnClauseFrom},
+			{Table: "t", Column: "i", Clause: ColumnClauseSelect},
+		})
 	})
 	t.Run("pivot_reads_inner_columns", func(t *testing.T) {
 		assertReferencedColumns(t, "pivot",
@@ -540,9 +779,16 @@ func TestReferencedColumnsFromConstructs(t *testing.T) {
 		)
 	})
 	t.Run("lateral_view_explode", func(t *testing.T) {
-		assertReferencedColumns(t, "lateral_view",
-			`SELECT e FROM t LATERAL VIEW explode(t.arr) tbl AS e`,
+		sql := `SELECT e FROM t LATERAL VIEW explode(t.arr) tbl AS e`
+		assertReferencedColumns(t, "lateral_view", sql,
 			map[string][]string{"t": {"arr", "e"}},
+			WithLineageDialect("spark"),
+		)
+		assertReferencedColumnUsages(t, "lateral_view", sql,
+			[]ColumnUse{
+				{Table: "t", Column: "arr", Clause: ColumnClauseLateralView},
+				{Table: "t", Column: "e", Clause: ColumnClauseSelect},
+			},
 			WithLineageDialect("spark"),
 		)
 	})
@@ -602,47 +848,82 @@ func TestReferencedColumnsDML(t *testing.T) {
 		dialect  string
 		sql      string
 		expected map[string][]string
+		usages   []ColumnUse
 	}{
 		{
 			name:     "delete_where",
 			dialect:  "trino",
 			sql:      `DELETE FROM t WHERE a > 1`,
 			expected: map[string][]string{"t": {"a"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "a", Clause: ColumnClauseWhere},
+			},
 		},
 		{
 			name:     "delete_using",
 			dialect:  "postgres",
 			sql:      `DELETE FROM t USING r WHERE t.id = r.id AND r.k > 1`,
 			expected: map[string][]string{"t": {"id"}, "r": {"id", "k"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "id", Clause: ColumnClauseWhere},
+				{Table: "r", Column: "id", Clause: ColumnClauseWhere},
+				{Table: "r", Column: "k", Clause: ColumnClauseWhere},
+			},
 		},
 		{
 			name:     "update_set_and_where",
 			dialect:  "trino",
 			sql:      `UPDATE t SET x = y + 1 WHERE a > 1`,
 			expected: map[string][]string{"t": {"a", "x", "y"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "x", Clause: ColumnClauseUpdateSetTarget},
+				{Table: "t", Column: "y", Clause: ColumnClauseUpdateSetValue},
+				{Table: "t", Column: "a", Clause: ColumnClauseWhere},
+			},
 		},
 		{
 			name:     "update_from",
 			dialect:  "postgres",
 			sql:      `UPDATE t SET x = s.v FROM r s WHERE t.id = s.id`,
 			expected: map[string][]string{"t": {"id", "x"}, "r": {"id", "v"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "x", Clause: ColumnClauseUpdateSetTarget},
+				{Table: "r", Column: "v", Clause: ColumnClauseUpdateSetValue},
+				{Table: "t", Column: "id", Clause: ColumnClauseWhere},
+				{Table: "r", Column: "id", Clause: ColumnClauseWhere},
+			},
 		},
 		{
 			name:     "merge",
 			dialect:  "trino",
 			sql:      `MERGE INTO t USING r ON t.id = r.id WHEN MATCHED THEN UPDATE SET x = r.v WHEN NOT MATCHED THEN INSERT (a) VALUES (r.b)`,
 			expected: map[string][]string{"t": {"id"}, "r": {"b", "id", "v"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "id", Clause: ColumnClauseMergeOn},
+				{Table: "r", Column: "id", Clause: ColumnClauseMergeOn},
+				{Table: "r", Column: "v", Clause: ColumnClauseMergeWhen},
+				{Table: "r", Column: "b", Clause: ColumnClauseMergeWhen},
+			},
 		},
 		{
 			name:     "merge_with_subquery_source",
 			dialect:  "trino",
 			sql:      `MERGE INTO t USING (SELECT id, v FROM r WHERE z > 0) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = s.v`,
 			expected: map[string][]string{"t": {"id"}, "r": {"id", "v", "z"}},
+			usages: []ColumnUse{
+				{Table: "t", Column: "id", Clause: ColumnClauseMergeOn},
+				{Table: "r", Column: "id", Clause: ColumnClauseSelect},
+				{Table: "r", Column: "id", Clause: ColumnClauseMergeOn},
+				{Table: "r", Column: "v", Clause: ColumnClauseSelect},
+				{Table: "r", Column: "v", Clause: ColumnClauseMergeWhen},
+				{Table: "r", Column: "z", Clause: ColumnClauseWhere},
+			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			assertReferencedColumns(t, tc.name, tc.sql, tc.expected, WithLineageDialect(tc.dialect))
+			assertReferencedColumnUsages(t, tc.name, tc.sql, tc.usages, WithLineageDialect(tc.dialect))
 		})
 	}
 }
@@ -950,11 +1231,18 @@ func TestBughuntCorrelatedUnqualifiedMetadata(t *testing.T) {
 
 // Set operation with trailing ORDER BY must not error or drop tables.
 func TestBughuntSetOpOrderBy(t *testing.T) {
-	got := rcHuntRun(t, `SELECT a FROM t UNION ALL SELECT b FROM r ORDER BY a`)
+	sql := `SELECT a FROM t UNION ALL SELECT b FROM r ORDER BY a`
+	got := rcHuntRun(t, sql)
 	want := rcHuntWant(map[string][]string{"t": {"a"}, "r": {"b"}})
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("set-op ORDER BY:\n got %v\nwant %v", got, want)
 	}
+	assertReferencedColumnUsages(t, "set_op_order_by", sql, []ColumnUse{
+		{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+		{Table: "t", Column: "a", Clause: ColumnClauseOrderBy},
+		{Table: "r", Column: "b", Clause: ColumnClauseSelect},
+		{Table: "r", Column: "b", Clause: ColumnClauseOrderBy},
+	})
 }
 
 // Nested set-ops.
@@ -1040,11 +1328,18 @@ func TestBughuntMergeWhenCondition(t *testing.T) {
 }
 
 func TestBughuntOrderByOrdinal(t *testing.T) {
-	got := rcHuntRun(t, `SELECT a, b FROM t ORDER BY 1, b`)
+	sql := `SELECT a, b FROM t ORDER BY 1, b`
+	got := rcHuntRun(t, sql)
 	want := rcHuntWant(map[string][]string{"t": {"a", "b"}})
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("order by ordinal:\n got %v\nwant %v", got, want)
 	}
+	assertReferencedColumnUsages(t, "order_by_ordinal", sql, []ColumnUse{
+		{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+		{Table: "t", Column: "a", Clause: ColumnClauseOrderBy},
+		{Table: "t", Column: "b", Clause: ColumnClauseSelect},
+		{Table: "t", Column: "b", Clause: ColumnClauseOrderBy},
+	})
 }
 
 func TestBughuntHavingAggregate(t *testing.T) {
@@ -1072,7 +1367,8 @@ func TestBughuntStarPartialMetadata(t *testing.T) {
 
 // Output hygiene: deduped and sorted per table.
 func TestBughuntDedupAndSorted(t *testing.T) {
-	got := rcHuntRun(t, `SELECT b, a, b FROM t WHERE a > 1 AND b < 2 ORDER BY a`)
+	sql := `SELECT b, a, b FROM t WHERE a > 1 AND b < 2 ORDER BY a`
+	got := rcHuntRun(t, sql)
 	want := rcHuntWant(map[string][]string{"t": {"a", "b"}})
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("dedup/sort:\n got %v\nwant %v", got, want)
@@ -1082,6 +1378,13 @@ func TestBughuntDedupAndSorted(t *testing.T) {
 			t.Errorf("columns for %s not sorted: %v", tbl, cols)
 		}
 	}
+	assertReferencedColumnUsages(t, "usage_dedup_and_sort", sql, []ColumnUse{
+		{Table: "t", Column: "b", Clause: ColumnClauseSelect},
+		{Table: "t", Column: "a", Clause: ColumnClauseSelect},
+		{Table: "t", Column: "b", Clause: ColumnClauseWhere},
+		{Table: "t", Column: "a", Clause: ColumnClauseWhere},
+		{Table: "t", Column: "a", Clause: ColumnClauseOrderBy},
+	})
 }
 
 // Three-part qualified column references cat.sch.tbl.col.

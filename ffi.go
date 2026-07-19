@@ -49,11 +49,12 @@ var (
 
 // Init eagerly loads and version-checks the bundled native SQL engine.
 //
-// It is optional: every API (ApplyRowFilter, LineageSourceColumns, ParseColumns, ReferencedColumns, …) initializes
-// the engine lazily on first use, so the package works out of the box with no
-// setup. Init exists so a long-running service can fail fast at startup instead
-// of on its first query. It is idempotent and safe for concurrent use; repeated
-// calls return the same result.
+// It is optional: every API (ApplyRowFilter, LineageSourceColumns, ParseColumns,
+// ReferencedColumns, ReferencedColumnUsages, …) initializes the engine lazily
+// on first use, so the package works out of the box with no setup. Init exists
+// so a long-running service can fail fast at startup instead of on its first
+// query. It is idempotent and safe for concurrent use; repeated calls return
+// the same result.
 //
 // Only the bundled artifact for the host OS/architecture is ever loaded — the
 // path is fixed and not user-configurable — and its version must match the

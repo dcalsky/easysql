@@ -55,7 +55,7 @@ var innerQueryKeys = []string{"query", "as_select", "expression", "this"}
 // setOpBranchKeys are the AST keys holding the operands of a set operation.
 var setOpBranchKeys = []string{"left", "right", "this", "expression"}
 
-// lineageOptions configures a LineageSourceColumns or ParseColumns call.
+// lineageOptions configures the lineage and column-analysis calls.
 type lineageOptions struct {
 	dialect   string
 	producer  string
@@ -63,7 +63,8 @@ type lineageOptions struct {
 	metadata  map[string][]string
 }
 
-// LineageOption configures LineageSourceColumns and ParseColumns.
+// LineageOption configures LineageSourceColumns, ParseColumns,
+// ReferencedColumns, and ReferencedColumnUsages.
 type LineageOption func(*lineageOptions)
 
 // lineageDialectAliases maps convenient dialect spellings to the token the
