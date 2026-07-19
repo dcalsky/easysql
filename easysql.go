@@ -329,7 +329,7 @@ func (r *rewriter) rewrite(sql string) (string, error) {
 	for _, m := range matches {
 		r.wrapTableNode(m.node, tmpl, m.alias)
 	}
-	rebindColumnRefs(stmts[0], rebindCtx)
+	rebindColumnRefs(stmts[0], rebindCtx, matches)
 
 	gen, err := r.client.Generate(mustMarshal(stmts), r.pg)
 	if err != nil || len(gen) == 0 {
@@ -405,6 +405,7 @@ func (r *rewriter) wrapTableNode(node map[string]any, tmpl map[string]any, alias
 
 	sub, _ := deepCopyJSON(tmpl).(map[string]any)
 	sub["alias"] = newIdent(alias.name, alias.quoted)
+	attachSubqueryColumnAliases(sub, orig)
 	if sel, ok := dig(sub, "this", "select"); ok {
 		if selMap, ok := sel.(map[string]any); ok {
 			if from, ok := selMap["from"].(map[string]any); ok {

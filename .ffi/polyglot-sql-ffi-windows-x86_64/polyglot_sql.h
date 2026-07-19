@@ -265,8 +265,8 @@ polyglot_result_t polyglot_transpile(const char *sql,
  * Transpile SQL between dialects with explicit transpile options.
  *
  * `options_json` must be a JSON object compatible with `TranspileOptions`, e.g.
- * `{"pretty": true, "unsupportedLevel": "raise"}`. Unknown fields are ignored;
- * omitted fields use their defaults.
+ * `{"pretty": true, "unsupportedLevel": "raise", "complexityGuard": {"maxFunctionCallDepth": 128}}`.
+ * Unknown fields are ignored; omitted fields use their defaults.
  */
 polyglot_result_t polyglot_transpile_with_options(const char *sql,
                                                   const char *from_dialect,
@@ -277,5 +277,15 @@ polyglot_result_t polyglot_transpile_with_options(const char *sql,
  * Validate SQL syntax for a dialect.
  */
 polyglot_validation_result_t polyglot_validate(const char *sql, const char *dialect);
+
+/**
+ * Validate SQL syntax and optional semantic warnings for a dialect.
+ *
+ * `options_json` must be a JSON object compatible with `ValidationOptions`, e.g.
+ * `{"strictSyntax": true, "semantic": true}`.
+ */
+polyglot_validation_result_t polyglot_validate_with_options(const char *sql,
+                                                            const char *dialect,
+                                                            const char *options_json);
 
 #endif  /* POLYGLOT_SQL_H */
