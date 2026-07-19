@@ -4,7 +4,7 @@ Go library for SQL analysis and rewriting, built on the
 [Polyglot SQL](https://github.com/tobilg/polyglot) engine (multi-dialect,
 sqlglot-compatible parser over FFI).
 
-Five capabilities, one dependency:
+Six capabilities, one dependency:
 
 | Function | Purpose |
 | -------- | ------- |
@@ -13,6 +13,7 @@ Five capabilities, one dependency:
 | [`LineageSourceColumns`](#lineagesourcecolumns) | Trace which source-table columns flow into a query's result |
 | [`ParseColumns`](#parsecolumns) | List the column names a statement exposes |
 | [`ReferencedColumns`](#referencedcolumns) | List every column a statement touches (projection + filters), per table |
+| [`ReferencedColumnUsages`](#referencedcolumnusages) | List touched columns together with their containing SQL clauses |
 
 Supported dialects include PostgreSQL, Trino/Presto, StarRocks, and MySQL.
 
@@ -274,11 +275,55 @@ plus the DML mutations above, and reuses `WithLineageDialect` /
 `WithLineageMetadata`. Use it for access-control / masking decisions, where a
 column read in a `WHERE` still counts as "touched".
 
+Use `ReferencedColumnUsages` when the caller also needs to distinguish where
+each column was used.
+
 **Fail-open by design.** The result is meant to over- rather than
 under-approximate: a reference whose table cannot be resolved (an unknown alias,
 a column absent from incomplete metadata, an unexpanded `SELECT *`) is
 *broadcast* to every candidate physical table in scope instead of being dropped.
 For an access-control caller, an extra column is harmless; a missing one is not.
+
+### ReferencedColumnUsages
+
+`ReferencedColumnUsages` is the clause-aware form of `ReferencedColumns`. Each
+result identifies a root physical table, column, and containing SQL clause:
+
+```go
+uses, err := easysql.ReferencedColumnUsages(`
+    SELECT u.name
+    FROM users u
+    JOIN orders o ON u.id = o.user_id
+    WHERE o.status = 'PAID'
+    GROUP BY u.name`,
+    easysql.WithLineageDialect("trino"),
+)
+// []easysql.ColumnUse{
+//   {Table: "orders", Column: "status",  Clause: easysql.ColumnClauseWhere},
+//   {Table: "orders", Column: "user_id", Clause: easysql.ColumnClauseJoinOn},
+//   {Table: "users",  Column: "id",      Clause: easysql.ColumnClauseJoinOn},
+//   {Table: "users",  Column: "name",    Clause: easysql.ColumnClauseGroupBy},
+//   {Table: "users",  Column: "name",    Clause: easysql.ColumnClauseSelect},
+// }
+```
+
+The result is deduplicated and sorted by table, column, then clause. A column
+used in several clauses has one entry per clause. Nested queries are classified
+against their own clauses; an inline window expression inside a projection is
+therefore `SELECT`, while columns in a named `WINDOW` definition are `WINDOW`.
+Projection aliases and positive ordinals in output-aware clauses such as
+`GROUP BY`, `QUALIFY`, and `ORDER BY` resolve back to their source columns.
+
+Clause values cover `SELECT`, `FROM`, `JOIN_ON`, `JOIN_USING`, `WHERE`,
+`GROUP_BY`, `HAVING`, `QUALIFY`, `WINDOW`, `ORDER_BY`, Spark/Hive
+`SORT_BY`/`DISTRIBUTE_BY`/`CLUSTER_BY`, `CONNECT_BY`, `LATERAL_VIEW`, and
+`UPDATE_SET_TARGET`, `UPDATE_SET_VALUE`, `MERGE_ON`, `MERGE_WHEN`.
+
+It uses the same dialect, metadata, wildcard expansion, CTE/subquery resolution,
+and fail-open attribution rules as `ReferencedColumns`. Unlike
+`ReferencedColumns`, it has no placeholder entry for a physical table that does
+not reference any column, because a `ColumnUse` always describes an actual
+table/column/clause tuple.
 
 ## Errors
 

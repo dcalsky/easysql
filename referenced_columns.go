@@ -28,6 +28,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/bytedance/sonic"
@@ -134,9 +136,10 @@ type selectBody struct {
 
 // setOpBody is the inner object of a {"union"|"intersect"|"except": …} node.
 type setOpBody struct {
-	Left  *queryNode  `json:"left"`
-	Right *queryNode  `json:"right"`
-	With  *withClause `json:"with"`
+	Left    *queryNode  `json:"left"`
+	Right   *queryNode  `json:"right"`
+	With    *withClause `json:"with"`
+	OrderBy expr        `json:"order_by"`
 }
 
 // queryNode is a SELECT or set operation (the unit innerQuery yields).
@@ -194,6 +197,43 @@ type statement struct {
 // Public API
 // ----------------------------------------------------------------------------
 
+// ColumnClause identifies the SQL clause that contains a column reference.
+// References inside nested queries are classified against the nested query's
+// own clause. For example, a column in a scalar subquery's SELECT list is
+// ColumnClauseSelect even when that subquery appears inside an outer WHERE.
+type ColumnClause string
+
+const (
+	ColumnClauseSelect          ColumnClause = "SELECT"
+	ColumnClauseFrom            ColumnClause = "FROM"
+	ColumnClauseJoinOn          ColumnClause = "JOIN_ON"
+	ColumnClauseJoinUsing       ColumnClause = "JOIN_USING"
+	ColumnClauseWhere           ColumnClause = "WHERE"
+	ColumnClauseGroupBy         ColumnClause = "GROUP_BY"
+	ColumnClauseHaving          ColumnClause = "HAVING"
+	ColumnClauseQualify         ColumnClause = "QUALIFY"
+	ColumnClauseWindow          ColumnClause = "WINDOW"
+	ColumnClauseOrderBy         ColumnClause = "ORDER_BY"
+	ColumnClauseSortBy          ColumnClause = "SORT_BY"
+	ColumnClauseDistributeBy    ColumnClause = "DISTRIBUTE_BY"
+	ColumnClauseClusterBy       ColumnClause = "CLUSTER_BY"
+	ColumnClauseConnectBy       ColumnClause = "CONNECT_BY"
+	ColumnClauseLateralView     ColumnClause = "LATERAL_VIEW"
+	ColumnClauseUpdateSetTarget ColumnClause = "UPDATE_SET_TARGET"
+	ColumnClauseUpdateSetValue  ColumnClause = "UPDATE_SET_VALUE"
+	ColumnClauseMergeOn         ColumnClause = "MERGE_ON"
+	ColumnClauseMergeWhen       ColumnClause = "MERGE_WHEN"
+)
+
+// ColumnUse is one distinct use of a root physical-table column in a SQL
+// clause. Table is fully qualified when the input SQL is fully qualified.
+// Repeated references to the same table, column, and clause are deduplicated.
+type ColumnUse struct {
+	Table  string
+	Column string
+	Clause ColumnClause
+}
+
 // ReferencedColumns returns, for each root physical table referenced by sql, the
 // sorted list of columns touched anywhere in the statement (projection and
 // filter positions alike). It accepts the same query-bearing statements as
@@ -228,6 +268,46 @@ func ReferencedColumns(sql string, opts ...LineageOption) (map[string][]string, 
 }
 
 func referencedColumns(client *polyglot.Client, sql string, opts ...LineageOption) (map[string][]string, error) {
+	rr, err := analyzeReferencedColumns(client, sql, false, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return sortedResult(rr.result), nil
+}
+
+// ReferencedColumnUsages returns the distinct root physical-table columns used
+// by sql together with the clause containing each use. Results are sorted by
+// table, column, then clause. It accepts the same statements, options, and
+// fail-open resolution rules as ReferencedColumns. Projection aliases and
+// positive ordinals in output-aware clauses resolve back to their source
+// columns.
+//
+// A table with no column reference has no ColumnUse entry; use
+// ReferencedColumns when callers also need empty table entries.
+func ReferencedColumnUsages(sql string, opts ...LineageOption) ([]ColumnUse, error) {
+	client, err := defaultClient()
+	if err != nil {
+		return nil, err
+	}
+	return referencedColumnUsages(client, sql, opts...)
+}
+
+func referencedColumnUsages(client *polyglot.Client, sql string, opts ...LineageOption) ([]ColumnUse, error) {
+	rr, err := analyzeReferencedColumns(client, sql, true, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return sortedColumnUses(rr.usages), nil
+}
+
+// analyzeReferencedColumns is the shared implementation behind the legacy
+// table->columns view and the richer clause-aware view.
+func analyzeReferencedColumns(
+	client *polyglot.Client,
+	sql string,
+	includeUsages bool,
+	opts ...LineageOption,
+) (*refResolver, error) {
 	if client == nil {
 		return nil, errors.New("easysql: nil polyglot client")
 	}
@@ -244,6 +324,9 @@ func referencedColumns(client *polyglot.Client, sql string, opts ...LineageOptio
 	}
 
 	rr := &refResolver{metadata: cfg.metadata, result: map[string]map[string]struct{}{}}
+	if includeUsages {
+		rr.usages = map[ColumnUse]struct{}{}
+	}
 
 	// DML mutations (DELETE / UPDATE / MERGE) are not query-bearing, so
 	// innerQuery cannot reach the columns they read in their WHERE / SET / ON /
@@ -255,27 +338,44 @@ func referencedColumns(client *polyglot.Client, sql string, opts ...LineageOptio
 	switch {
 	case st.Delete != nil:
 		rr.resolveDelete(st.Delete)
-		return sortedResult(rr.result), nil
+		return rr, nil
 	case st.Update != nil:
 		rr.resolveUpdate(st.Update)
-		return sortedResult(rr.result), nil
+		return rr, nil
 	case st.Merge != nil:
 		rr.resolveMerge(st.Merge)
-		return sortedResult(rr.result), nil
+		return rr, nil
 	}
 
 	// CREATE VIEW / CTAS / INSERT ... SELECT etc. are unwrapped to their inner
 	// query by the shared innerQuery helper before structural decoding.
 	inner := innerQuery(stmt)
 	if inner == nil {
-		return sortedResult(rr.result), nil
+		return rr, nil
 	}
 	q, err := decodeQueryMap(inner)
 	if err != nil {
 		return nil, err
 	}
 	rr.resolveQuery(q, nil)
-	return sortedResult(rr.result), nil
+	return rr, nil
+}
+
+func sortedColumnUses(usages map[ColumnUse]struct{}) []ColumnUse {
+	out := make([]ColumnUse, 0, len(usages))
+	for use := range usages {
+		out = append(out, use)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Table != out[j].Table {
+			return out[i].Table < out[j].Table
+		}
+		if out[i].Column != out[j].Column {
+			return out[i].Column < out[j].Column
+		}
+		return out[i].Clause < out[j].Clause
+	})
+	return out
 }
 
 // ----------------------------------------------------------------------------
@@ -292,8 +392,9 @@ type colRef struct {
 // column names and, per output name, the root (table, column) refs that produced
 // it. A parent scope uses it to resolve references to this scope's alias.
 type resolvedOut struct {
-	names  []string
-	byName map[string][]colRef
+	names     []string
+	byName    map[string][]colRef
+	positions [][]colRef
 }
 
 func emptyOut() *resolvedOut { return &resolvedOut{byName: map[string][]colRef{}} }
@@ -302,6 +403,11 @@ func (o *resolvedOut) add(name string, refs []colRef) {
 	o.names = append(o.names, name)
 	key := strings.ToLower(name)
 	o.byName[key] = append(o.byName[key], refs...)
+	o.positions = append(o.positions, refs)
+}
+
+func (o *resolvedOut) addPosition(refs []colRef) {
+	o.positions = append(o.positions, refs)
 }
 
 type sourceKind int
@@ -340,6 +446,7 @@ type scopeCtx struct {
 type refResolver struct {
 	metadata map[string][]string
 	result   map[string]map[string]struct{}
+	usages   map[ColumnUse]struct{}
 
 	// flowOnly switches the resolver from "columns touched anywhere"
 	// (ReferencedColumns) to "columns whose values flow into the result"
@@ -350,7 +457,7 @@ type refResolver struct {
 	flowOnly bool
 }
 
-func (rr *refResolver) add(table, col string) {
+func (rr *refResolver) add(table, col string, clause ColumnClause) {
 	if rr.flowOnly {
 		// In flow mode nothing is recorded eagerly; the caller records the
 		// final output refs. Column refs still propagate through the returned
@@ -361,11 +468,14 @@ func (rr *refResolver) add(table, col string) {
 		return
 	}
 	ensureSet(rr.result, table)[col] = struct{}{}
+	if clause != "" && rr.usages != nil {
+		rr.usages[ColumnUse{Table: table, Column: col, Clause: clause}] = struct{}{}
+	}
 }
 
-func (rr *refResolver) addRefs(refs []colRef) {
+func (rr *refResolver) addRefs(refs []colRef, clause ColumnClause) {
 	for _, r := range refs {
-		rr.add(r.table, r.col)
+		rr.add(r.table, r.col, clause)
 	}
 }
 
@@ -466,7 +576,7 @@ func (rr *refResolver) resolveSelect(sel *selectBody, parent *scopeCtx) *resolve
 	// sources — and thus all aliases — are known.
 	if !rr.flowOnly {
 		for _, d := range ctx.deferred {
-			rr.collect(d, ctx)
+			rr.collect(d, ctx, ColumnClauseFrom)
 		}
 	}
 
@@ -479,19 +589,36 @@ func (rr *refResolver) resolveSelect(sel *selectBody, parent *scopeCtx) *resolve
 		return out
 	}
 
-	// Filter and grouping positions: record refs only.
-	for _, e := range []expr{
-		sel.Where, sel.GroupBy, sel.Having, sel.Qualify, sel.Windows,
-		sel.OrderBy, sel.SortBy, sel.DistributeBy, sel.ClusterBy, sel.Connect, sel.LateralViews,
+	// Non-projection positions: record refs with their containing clause.
+	for _, item := range []struct {
+		expr        expr
+		clause      ColumnClause
+		outputAware bool
+	}{
+		{sel.Where, ColumnClauseWhere, false},
+		{sel.GroupBy, ColumnClauseGroupBy, true},
+		{sel.Having, ColumnClauseHaving, true},
+		{sel.Qualify, ColumnClauseQualify, true},
+		{sel.Windows, ColumnClauseWindow, false},
+		{sel.OrderBy, ColumnClauseOrderBy, true},
+		{sel.SortBy, ColumnClauseSortBy, true},
+		{sel.DistributeBy, ColumnClauseDistributeBy, true},
+		{sel.ClusterBy, ColumnClauseClusterBy, true},
+		{sel.Connect, ColumnClauseConnectBy, false},
+		{sel.LateralViews, ColumnClauseLateralView, false},
 	} {
-		rr.collect(e, ctx)
+		if item.outputAware {
+			rr.collectOutputClause(item.expr, ctx, item.clause, out)
+		} else {
+			rr.collect(item.expr, ctx, item.clause)
+		}
 	}
 	for _, j := range sel.Joins {
-		rr.collect(j.On, ctx)
+		rr.collect(j.On, ctx, ColumnClauseJoinOn)
 		// USING (c1, c2) names columns shared by both joined tables; resolve each
 		// as an unqualified column.
 		for _, u := range j.Using {
-			rr.addRefs(rr.resolveUnqualified(u.text(), ctx))
+			rr.addRefs(rr.resolveUnqualified(u.text(), ctx), ColumnClauseJoinUsing)
 		}
 	}
 	return out
@@ -513,6 +640,20 @@ func (rr *refResolver) resolveSetOp(body *setOpBody, parent *scopeCtx) *resolved
 			refs = append(refs, right.byName[strings.ToLower(right.names[i])]...)
 		}
 		out.byName[key] = refs
+	}
+	positionCount := max(len(left.positions), len(right.positions))
+	for i := 0; i < positionCount; i++ {
+		var refs []colRef
+		if i < len(left.positions) {
+			refs = append(refs, left.positions[i]...)
+		}
+		if i < len(right.positions) {
+			refs = append(refs, right.positions[i]...)
+		}
+		out.addPosition(refs)
+	}
+	if !rr.flowOnly {
+		rr.collectOutputClause(body.OrderBy, ctx, ColumnClauseOrderBy, out)
 	}
 	return out
 }
@@ -647,8 +788,8 @@ func rootsOfOut(out *resolvedOut) []string {
 	}
 	seen := map[string]struct{}{}
 	var roots []string
-	for _, name := range out.names {
-		for _, r := range out.byName[strings.ToLower(name)] {
+	for _, refs := range out.positions {
+		for _, r := range refs {
 			if r.table == "" {
 				continue
 			}
@@ -689,23 +830,25 @@ func (rr *refResolver) buildOut(expressions []expr, ctx *scopeCtx) *resolvedOut 
 		case has(obj, "alias"):
 			var al aliasNode
 			_ = decodeInto(obj["alias"], &al)
-			out.add(al.Alias.text(), rr.collectRefs(al.This, ctx))
+			out.add(al.Alias.text(), rr.collectRefs(al.This, ctx, ColumnClauseSelect))
 		case has(obj, "column"):
 			var cn columnNode
 			_ = decodeInto(obj["column"], &cn)
-			out.add(cn.Name.text(), rr.collectRefs(item, ctx))
+			out.add(cn.Name.text(), rr.collectRefs(item, ctx, ColumnClauseSelect))
 		case has(obj, "dot"):
 			col, _ := dotColumn(item)
-			out.add(col, rr.collectRefs(item, ctx))
+			out.add(col, rr.collectRefs(item, ctx, ColumnClauseSelect))
 		default:
 			// Unaliased expression: still record its referenced columns; its
 			// output name is engine-defined (_colN) and not tracked here. In
 			// flow mode the refs must still propagate to the caller (e.g. a
 			// scalar subquery whose single value is an unaliased aggregate), so
 			// attach them to the output under an empty name.
-			refs := rr.collectRefs(item, ctx)
+			refs := rr.collectRefs(item, ctx, ColumnClauseSelect)
 			if rr.flowOnly {
 				out.add("", refs)
+			} else {
+				out.addPosition(refs)
 			}
 		}
 	}
@@ -721,17 +864,17 @@ func (rr *refResolver) expandStar(star *starNode, ctx *scopeCtx) []namedRefs {
 		case srcDerived:
 			for _, name := range s.out.names {
 				refs := s.out.byName[strings.ToLower(name)]
-				rr.addRefs(refs)
+				rr.addRefs(refs, ColumnClauseSelect)
 				out = append(out, namedRefs{name: name, refs: refs})
 			}
 		case srcPhysical:
 			if cols, ok := lookupMetadataColumns(rr.metadata, s.table); ok {
 				for _, c := range cols {
-					rr.add(s.table, c)
+					rr.add(s.table, c, ColumnClauseSelect)
 					out = append(out, namedRefs{name: c, refs: []colRef{{s.table, c}}})
 				}
 			} else {
-				rr.add(s.table, "*")
+				rr.add(s.table, "*", ColumnClauseSelect)
 				out = append(out, namedRefs{name: "*", refs: []colRef{{s.table, "*"}}})
 			}
 		}
@@ -753,7 +896,7 @@ func (rr *refResolver) expandStar(star *starNode, ctx *scopeCtx) []namedRefs {
 			roots = []string{qualifier}
 		}
 		for _, r := range roots {
-			rr.add(r, "*")
+			rr.add(r, "*", ColumnClauseSelect)
 			out = append(out, namedRefs{name: "*", refs: []colRef{{r, "*"}}})
 		}
 		return out
@@ -772,30 +915,89 @@ func (rr *refResolver) expandStar(star *starNode, ctx *scopeCtx) []namedRefs {
 // nested query (subquery in IN/EXISTS/ANY/scalar, …) is resolved as its own
 // scope; a bare "*" (e.g. count(*)) is ignored — projection-position stars are
 // expanded by buildOut instead.
-func (rr *refResolver) collect(e expr, ctx *scopeCtx) {
+func (rr *refResolver) collect(e expr, ctx *scopeCtx, clause ColumnClause) {
+	rr.collectWithOutput(e, ctx, clause, nil)
+}
+
+// collectOutputClause handles a clause whose unqualified names and positive
+// integer ordinals may refer to SELECT outputs. The AST represents ORDER BY 1,
+// for example, as a direct numeric literal under one ordered expression; numeric
+// literals nested inside a larger expression remain ordinary literals.
+func (rr *refResolver) collectOutputClause(
+	e expr,
+	ctx *scopeCtx,
+	clause ColumnClause,
+	out *resolvedOut,
+) {
+	obj, ok := decodeObj(e)
+	if !ok {
+		rr.collectWithOutput(e, ctx, clause, out)
+		return
+	}
+	items := decodeArr(obj["expressions"])
+	if items == nil {
+		rr.collectWithOutput(e, ctx, clause, out)
+		return
+	}
+	for _, item := range items {
+		target := item
+		if ordered, ok := decodeObj(item); ok && has(ordered, "this") {
+			target = ordered["this"]
+		}
+		if ordinal, ok := outputOrdinal(target); ok {
+			if ordinal <= len(out.positions) {
+				rr.addRefs(out.positions[ordinal-1], clause)
+			}
+			continue
+		}
+		rr.collectWithOutput(item, ctx, clause, out)
+	}
+}
+
+func outputOrdinal(e expr) (int, bool) {
+	obj, ok := decodeObj(e)
+	if !ok || !has(obj, "literal") {
+		return 0, false
+	}
+	var lit struct {
+		LiteralType string `json:"literal_type"`
+		Value       string `json:"value"`
+	}
+	if decodeInto(obj["literal"], &lit) != nil || lit.LiteralType != "number" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(lit.Value)
+	return n, err == nil && n > 0
+}
+
+// collectWithOutput additionally resolves unqualified references to projection
+// names visible in clauses such as GROUP BY, QUALIFY, and ORDER BY. This maps an
+// alias back to the root columns that produce it instead of fabricating a source
+// column with the alias's name.
+func (rr *refResolver) collectWithOutput(e expr, ctx *scopeCtx, clause ColumnClause, out *resolvedOut) {
 	if obj, ok := decodeObj(e); ok {
 		switch {
 		case isQueryObj(obj):
 			rr.resolveQuery(mustQuery(e), ctx)
 		case has(obj, "column"):
-			rr.recordColumn(obj["column"], ctx)
+			rr.recordColumnWithOutput(obj["column"], ctx, clause, out)
 		case has(obj, "dot"):
-			rr.recordDot(e, ctx)
+			rr.recordDot(e, ctx, clause)
 		default:
 			for _, v := range obj {
-				rr.collect(v, ctx)
+				rr.collectWithOutput(v, ctx, clause, out)
 			}
 		}
 		return
 	}
 	for _, v := range decodeArr(e) {
-		rr.collect(v, ctx)
+		rr.collectWithOutput(v, ctx, clause, out)
 	}
 }
 
 // collectRefs is collect that also returns the resolved refs, used to build a
 // projection's output mapping.
-func (rr *refResolver) collectRefs(e expr, ctx *scopeCtx) []colRef {
+func (rr *refResolver) collectRefs(e expr, ctx *scopeCtx, clause ColumnClause) []colRef {
 	var acc []colRef
 	var walk func(expr)
 	walk = func(n expr) {
@@ -804,17 +1006,15 @@ func (rr *refResolver) collectRefs(e expr, ctx *scopeCtx) []colRef {
 			case isQueryObj(obj):
 				sub := rr.resolveQuery(mustQuery(n), ctx)
 				// A scalar subquery in an expression position contributes its
-				// output value(s) to the enclosing projection, so in flow mode
-				// its resolved refs must flow up into this projection's refs.
-				if rr.flowOnly {
-					for _, name := range sub.names {
-						acc = append(acc, sub.byName[strings.ToLower(name)]...)
-					}
+				// output value(s) to the enclosing projection. Keep those refs
+				// for both flow analysis and output-alias resolution.
+				for _, refs := range sub.positions {
+					acc = append(acc, refs...)
 				}
 			case has(obj, "column"):
-				acc = append(acc, rr.recordColumn(obj["column"], ctx)...)
+				acc = append(acc, rr.recordColumn(obj["column"], ctx, clause)...)
 			case has(obj, "dot"):
-				acc = append(acc, rr.recordDot(n, ctx)...)
+				acc = append(acc, rr.recordDot(n, ctx, clause)...)
 			default:
 				for _, v := range obj {
 					walk(v)
@@ -832,25 +1032,40 @@ func (rr *refResolver) collectRefs(e expr, ctx *scopeCtx) []colRef {
 
 // recordColumn resolves and records a two-part-or-less column reference (the raw
 // is the body under the "column" key).
-func (rr *refResolver) recordColumn(colBody expr, ctx *scopeCtx) []colRef {
+func (rr *refResolver) recordColumn(colBody expr, ctx *scopeCtx, clause ColumnClause) []colRef {
+	return rr.recordColumnWithOutput(colBody, ctx, clause, nil)
+}
+
+func (rr *refResolver) recordColumnWithOutput(
+	colBody expr,
+	ctx *scopeCtx,
+	clause ColumnClause,
+	out *resolvedOut,
+) []colRef {
 	var cn columnNode
 	if decodeInto(colBody, &cn) != nil || cn.Name.text() == "" {
 		return nil
 	}
+	if cn.Table.text() == "" && out != nil {
+		if refs, ok := out.byName[strings.ToLower(cn.Name.text())]; ok {
+			rr.addRefs(refs, clause)
+			return refs
+		}
+	}
 	refs := rr.resolve(cn.Table.text(), cn.Name.text(), ctx)
-	rr.addRefs(refs)
+	rr.addRefs(refs, clause)
 	return refs
 }
 
 // recordDot resolves and records a dotted reference (schema.table.col, …). node
 // is the whole {"dot": …} wrapper.
-func (rr *refResolver) recordDot(node expr, ctx *scopeCtx) []colRef {
+func (rr *refResolver) recordDot(node expr, ctx *scopeCtx, clause ColumnClause) []colRef {
 	col, qualifier := dotColumn(node)
 	if col == "" {
 		return nil
 	}
 	refs := rr.resolve(qualifier, col, ctx)
-	rr.addRefs(refs)
+	rr.addRefs(refs, clause)
 	return refs
 }
 
@@ -1009,7 +1224,9 @@ func applyColumnAliases(out *resolvedOut, aliases []string) *resolvedOut {
 	renamed := emptyOut()
 	for i, a := range aliases {
 		var refs []colRef
-		if i < len(out.names) {
+		if i < len(out.positions) {
+			refs = out.positions[i]
+		} else if i < len(out.names) {
 			refs = out.byName[strings.ToLower(out.names[i])]
 		}
 		renamed.add(a, refs)
@@ -1033,16 +1250,16 @@ func (rr *refResolver) resolveDelete(del *deleteNode) {
 		rr.addSource(u, ctx)
 	}
 	for _, d := range ctx.deferred {
-		rr.collect(d, ctx)
+		rr.collect(d, ctx, ColumnClauseFrom)
 	}
-	rr.collect(del.Where, ctx)
+	rr.collect(del.Where, ctx, ColumnClauseWhere)
 	for _, j := range del.Joins {
-		rr.collect(j.On, ctx)
+		rr.collect(j.On, ctx, ColumnClauseJoinOn)
 		for _, u := range j.Using {
-			rr.addRefs(rr.resolveUnqualified(u.text(), ctx))
+			rr.addRefs(rr.resolveUnqualified(u.text(), ctx), ColumnClauseJoinUsing)
 		}
 	}
-	rr.collect(del.OrderBy, ctx)
+	rr.collect(del.OrderBy, ctx, ColumnClauseOrderBy)
 }
 
 // resolveUpdate handles UPDATE … SET … [FROM …] WHERE …, capturing both the SET
@@ -1061,7 +1278,7 @@ func (rr *refResolver) resolveUpdate(upd *updateNode) {
 		rr.addSource(j.This, ctx)
 	}
 	for _, d := range ctx.deferred {
-		rr.collect(d, ctx)
+		rr.collect(d, ctx, ColumnClauseFrom)
 	}
 
 	// SET pairs: [targetColumnIdentifier, valueExpression].
@@ -1082,23 +1299,23 @@ func (rr *refResolver) resolveUpdate(upd *updateNode) {
 			if col != "" {
 				if qualifier != "" {
 					for _, ref := range rr.resolveQualified(strings.ToLower(qualifier), col, ctx) {
-						rr.add(ref.table, ref.col)
+						rr.add(ref.table, ref.col, ColumnClauseUpdateSetTarget)
 					}
 				} else {
-					rr.add(targetRoot, col)
+					rr.add(targetRoot, col, ColumnClauseUpdateSetTarget)
 				}
 			}
 		}
 		for i := 1; i < len(pair); i++ {
-			rr.collect(pair[i], ctx)
+			rr.collect(pair[i], ctx, ColumnClauseUpdateSetValue)
 		}
 	}
 
-	rr.collect(upd.Where, ctx)
+	rr.collect(upd.Where, ctx, ColumnClauseWhere)
 	for _, j := range upd.FromJoins {
-		rr.collect(j.On, ctx)
+		rr.collect(j.On, ctx, ColumnClauseJoinOn)
 	}
-	rr.collect(upd.OrderBy, ctx)
+	rr.collect(upd.OrderBy, ctx, ColumnClauseOrderBy)
 }
 
 // resolveMerge handles MERGE INTO … USING … ON … WHEN …, capturing the ON
@@ -1108,10 +1325,10 @@ func (rr *refResolver) resolveMerge(mrg *mergeNode) {
 	rr.addSource(mrg.This, ctx)
 	rr.addSource(mrg.Using, ctx)
 	for _, d := range ctx.deferred {
-		rr.collect(d, ctx)
+		rr.collect(d, ctx, ColumnClauseFrom)
 	}
-	rr.collect(mrg.On, ctx)
-	rr.collect(mrg.Whens, ctx)
+	rr.collect(mrg.On, ctx, ColumnClauseMergeOn)
+	rr.collect(mrg.Whens, ctx, ColumnClauseMergeWhen)
 }
 
 // ----------------------------------------------------------------------------
