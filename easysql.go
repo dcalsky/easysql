@@ -1,6 +1,7 @@
-// Package easysql rewrites SELECT statements to enforce row-level access policies,
-// built on the Polyglot SQL engine (a multi-dialect sqlglot-compatible parser
-// exposed to Go over an FFI library).
+// Package easysql analyzes and structurally rewrites multi-dialect SQL using the
+// Polyglot SQL engine (a sqlglot-compatible parser exposed to Go over an FFI
+// library). Its rewrite operations include binding queries as CTEs, replacing
+// table references, and enforcing row-level access policies.
 //
 // Given a boolean predicate, every reference to an in-scope physical table is
 // turned into a filtered derived table:

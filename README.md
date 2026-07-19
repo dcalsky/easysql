@@ -4,10 +4,11 @@ Go library for SQL analysis and rewriting, built on the
 [Polyglot SQL](https://github.com/tobilg/polyglot) engine (multi-dialect,
 sqlglot-compatible parser over FFI).
 
-Four capabilities, one dependency:
+Five capabilities, one dependency:
 
 | Function | Purpose |
 | -------- | ------- |
+| [`BindCTEs`](#bindctes) | Bind query SQL to virtual table names as CTEs |
 | [`ApplyRowFilter`](#applyrowfilter) | Rewrite `SELECT` statements to enforce row-level access policies |
 | [`LineageSourceColumns`](#lineagesourcecolumns) | Trace which source-table columns flow into a query's result |
 | [`ParseColumns`](#parsecolumns) | List the column names a statement exposes |
@@ -99,6 +100,55 @@ out, err := easysql.ApplyRowFilter(sql, whereClause,
 
 `whereClause` is spliced verbatim into the AST — the caller is responsible for
 binding and escaping any values inside it.
+
+### BindCTEs
+
+Combines independently supplied queries by binding each source query to a CTE
+name visible to a consumer query. Both the consumer and every binding must be a
+single `SELECT` or set operation:
+
+```go
+out, err := easysql.BindCTEs(
+    `SELECT * FROM foo WHERE total_amount > 1000`,
+    []easysql.CTEBinding{{
+        Name: "foo",
+        Query: `
+            WITH paid_orders AS (
+                SELECT customer_id, amount
+                FROM orders
+                WHERE status = 'paid'
+            )
+            SELECT customer_id, SUM(amount) AS total_amount
+            FROM paid_orders
+            GROUP BY customer_id`,
+    }},
+    easysql.WithBindCTEDialect("trino"),
+)
+```
+
+The result is structurally equivalent to:
+
+```sql
+WITH foo AS (
+    WITH paid_orders AS (
+        SELECT customer_id, amount
+        FROM orders
+        WHERE status = 'paid'
+    )
+    SELECT customer_id, SUM(amount) AS total_amount
+    FROM paid_orders
+    GROUP BY customer_id
+)
+SELECT *
+FROM foo
+WHERE total_amount > 1000
+```
+
+Bindings are inserted in slice order before CTEs already present in the
+consumer. A binding can therefore reference an earlier binding, and consumer
+CTEs can reference any binding. Duplicate names are rejected. Composition is
+performed on parsed ASTs rather than through SQL string interpolation; output is
+normalized, comments are dropped, and validity is checked by re-parsing.
 
 ### LineageSourceColumns
 
