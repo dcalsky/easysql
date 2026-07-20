@@ -645,6 +645,30 @@ func TestBughuntTableNamesMatching(t *testing.T) {
 	}
 }
 
+// A catalog-qualified scope must match the complete catalog.schema.table name,
+// without leaking to an otherwise-identical table in another catalog.
+func TestApplyRowFilterCatalogQualifiedTableNames(t *testing.T) {
+	const table = "rda_launch_to_engage.interaction"
+	out := bughuntApply(t, "trino", "select * from iceberg."+table,
+		WithTableNames("iceberg.rda_launch_to_engage.interaction"))
+	if got := bughuntWraps(t, out, "trino"); got != 1 {
+		t.Fatalf("catalog-qualified scope should wrap the exact table, wraps=%d: %s", got, out)
+	}
+
+	out = bughuntApply(t, "trino", "select * from hive."+table,
+		WithTableNames("iceberg.rda_launch_to_engage.interaction"))
+	if got := bughuntWraps(t, out, "trino"); got != 0 {
+		t.Fatalf("catalog-qualified scope must not leak across catalogs, wraps=%d: %s", got, out)
+	}
+
+	// Existing schema-qualified scopes remain catalog-agnostic.
+	out = bughuntApply(t, "trino", "select * from iceberg."+table,
+		WithTableNames(table))
+	if got := bughuntWraps(t, out, "trino"); got != 1 {
+		t.Fatalf("schema-qualified scope should still match through a catalog, wraps=%d: %s", got, out)
+	}
+}
+
 // A CTE name in scope must not suppress wrapping of a physical table with the
 // same bare name in a SIBLING scope (regression family of TestCTEScopeSecurity).
 func TestBughuntCTESiblingScope(t *testing.T) {
