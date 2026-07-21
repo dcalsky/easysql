@@ -94,7 +94,7 @@ out, err := easysql.ApplyRowFilter(sql, whereClause,
 | Option | Description |
 | ------ | ----------- |
 | `WithDialect(d)` | `mysql` (default), `starrocks`, `postgres`, `trino` |
-| `WithTableNames(...)` | Restrict rewriting to these tables (bare or `schema.table`) |
+| `WithTableNames(...)` | Restrict rewriting to these tables (bare, `schema.table`, or `catalog.schema.table`) |
 | `WithTableRegexp(...)` | Restrict to tables matching a Go regexp; composes with `WithTableNames` |
 | `WithDefaultDB(db)` | Schema for resolving unqualified table names |
 | `WithSelfCheck(bool)` | Deprecated no-op; output is always re-parsed |

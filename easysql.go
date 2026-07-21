@@ -65,11 +65,12 @@ type rewriter struct {
 
 	// Table scope. scopeSet becomes true once any scope option is supplied;
 	// while it is false the WHERE expression applies to every table.
-	scopeSet  bool
-	byKey     map[string]bool // "schema\x00table"
-	byName    map[string]bool // bare table names
-	regexps   []*regexp.Regexp
-	defaultDB string
+	scopeSet     bool
+	byCatalogKey map[string]bool // "catalog\x00schema\x00table"
+	byKey        map[string]bool // "schema\x00table"
+	byName       map[string]bool // bare table names
+	regexps      []*regexp.Regexp
+	defaultDB    string
 
 	// whereText is the caller's predicate, baked verbatim into the subquery
 	// template's WHERE clause.
@@ -98,7 +99,8 @@ type options struct {
 func WithDefaultDB(db string) Option { return func(o *options) { o.defaultDB = db } }
 
 // WithTableNames restricts the WHERE expression to the given tables. Names may
-// be bare ("orders") or schema-qualified ("sales.orders").
+// be bare ("orders"), schema-qualified ("sales.orders"), or catalog-qualified
+// ("iceberg.sales.orders").
 func WithTableNames(names ...string) Option {
 	return func(o *options) { o.tableNames = append(o.tableNames, names...) }
 }
@@ -167,22 +169,26 @@ func compile(client *polyglot.Client, whereClause string, opts ...Option) (*rewr
 	}
 
 	r := &rewriter{
-		client:    client,
-		dialect:   cfg.dialect,
-		pg:        pg,
-		byKey:     map[string]bool{},
-		byName:    map[string]bool{},
-		defaultDB: strings.ToLower(strings.TrimSpace(cfg.defaultDB)),
+		client:       client,
+		dialect:      cfg.dialect,
+		pg:           pg,
+		byCatalogKey: map[string]bool{},
+		byKey:        map[string]bool{},
+		byName:       map[string]bool{},
+		defaultDB:    strings.ToLower(strings.TrimSpace(cfg.defaultDB)),
 	}
 
 	if cfg.tableNames != nil {
 		r.scopeSet = true
 		for _, n := range cfg.tableNames {
-			schema, table := splitName(n)
+			catalog, schema, table := splitName(n)
 			if table == "" {
 				continue
 			}
-			if schema != "" {
+			if catalog != "" && schema != "" {
+				r.byCatalogKey[strings.ToLower(catalog)+"\x00"+
+					strings.ToLower(schema)+"\x00"+strings.ToLower(table)] = true
+			} else if schema != "" {
 				r.byKey[strings.ToLower(schema)+"\x00"+strings.ToLower(table)] = true
 			} else {
 				r.byName[strings.ToLower(table)] = true
@@ -200,7 +206,8 @@ func compile(client *polyglot.Client, whereClause string, opts ...Option) (*rewr
 		}
 		r.regexps = append(r.regexps, rx)
 	}
-	if r.scopeSet && len(r.byKey) == 0 && len(r.byName) == 0 && len(r.regexps) == 0 {
+	if r.scopeSet && len(r.byCatalogKey) == 0 && len(r.byKey) == 0 &&
+		len(r.byName) == 0 && len(r.regexps) == 0 {
 		return nil, errors.New("easysql: a table scope option was provided but matched no tables")
 	}
 
@@ -451,7 +458,10 @@ func (r *rewriter) matches(v map[string]any) bool {
 		return false
 	}
 	nameL := strings.ToLower(name)
-	schemaW := strings.ToLower(identName(t["schema"]))
+	schema := identName(t["schema"])
+	catalog := identName(t["catalog"])
+	schemaW := strings.ToLower(schema)
+	catalogW := strings.ToLower(catalog)
 
 	if schemaW == "" && nameL == "dual" {
 		return false
@@ -463,6 +473,10 @@ func (r *rewriter) matches(v map[string]any) bool {
 	if schemaR == "" {
 		schemaR = r.defaultDB
 	}
+	if catalogW != "" && schemaW != "" &&
+		r.byCatalogKey[catalogW+"\x00"+schemaW+"\x00"+nameL] {
+		return true
+	}
 	if schemaR != "" && r.byKey[schemaR+"\x00"+nameL] {
 		return true
 	}
@@ -471,7 +485,10 @@ func (r *rewriter) matches(v map[string]any) bool {
 	}
 	fullName := name
 	if schemaW != "" {
-		fullName = identName(t["schema"]) + "." + name
+		fullName = schema + "." + name
+	}
+	if catalogW != "" {
+		fullName = catalog + "." + fullName
 	}
 	for _, rx := range r.regexps {
 		if rx.MatchString(name) || rx.MatchString(fullName) {
@@ -716,12 +733,24 @@ func identName(v any) string {
 	return ""
 }
 
-func splitName(name string) (schema, table string) {
-	name = strings.TrimSpace(name)
-	if i := strings.Index(name, "."); i >= 0 {
-		return strings.TrimSpace(name[:i]), strings.TrimSpace(name[i+1:])
+func splitName(name string) (catalog, schema, table string) {
+	parts := strings.Split(strings.TrimSpace(name), ".")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+		if parts[i] == "" {
+			return "", "", ""
+		}
 	}
-	return "", name
+	switch len(parts) {
+	case 1:
+		return "", "", parts[0]
+	case 2:
+		return "", parts[0], parts[1]
+	case 3:
+		return parts[0], parts[1], parts[2]
+	default:
+		return "", "", ""
+	}
 }
 
 func dig(m map[string]any, keys ...string) (any, bool) {
