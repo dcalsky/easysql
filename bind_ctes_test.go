@@ -218,6 +218,29 @@ func TestBindCTEsAdditionalQueryShapes(t *testing.T) {
 	}
 }
 
+func TestBindCTEsDoesNotShadowQualifiedPhysicalTable(t *testing.T) {
+	out := bindCTEsValid(t, "trino",
+		`SELECT * FROM foo.bar WHERE total_amount > 1000`,
+		[]CTEBinding{{
+			Name: "bar",
+			Query: `
+				WITH paid_orders AS (
+					SELECT customer_id, amount
+					FROM orders
+					WHERE status = 'paid'
+				)
+				SELECT customer_id, SUM(amount) AS total_amount
+				FROM paid_orders
+				GROUP BY customer_id`,
+		}},
+	)
+
+	const want = "WITH bar AS (WITH paid_orders AS (SELECT customer_id, amount FROM orders WHERE status = 'paid') SELECT customer_id, SUM(amount) AS total_amount FROM paid_orders GROUP BY customer_id) SELECT * FROM foo.bar WHERE total_amount > 1000"
+	if out != want {
+		t.Fatalf("qualified physical table must not be shadowed by a bare CTE name:\nwant: %s\n got: %s", want, out)
+	}
+}
+
 func TestBindCTEsPreservesSourceWithClause(t *testing.T) {
 	const want = "WITH foo AS (WITH paid AS (SELECT order_id, amount FROM orders WHERE status = 'paid') SELECT order_id, amount FROM paid) SELECT * FROM foo"
 	for _, dialect := range []string{"mysql", "starrocks", "postgres", "trino"} {
