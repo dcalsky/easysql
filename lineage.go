@@ -52,9 +52,6 @@ const (
 // avoid re-allocating the slice on every call.
 var innerQueryKeys = []string{"query", "as_select", "expression", "this"}
 
-// setOpBranchKeys are the AST keys holding the operands of a set operation.
-var setOpBranchKeys = []string{"left", "right", "this", "expression"}
-
 // lineageOptions configures the lineage and column-analysis calls.
 type lineageOptions struct {
 	dialect   string
@@ -145,21 +142,10 @@ func LineageSourceColumns(sql string, opts ...LineageOption) (map[string][]strin
 		return nil, err
 	}
 
-	// Trace each output column back to its source columns. Set operations
-	// (UNION / INTERSECT / EXCEPT) are split into their leaf SELECTs and merged,
-	// because the OpenLineage engine rejects set operations directly.
-	for _, leaf := range req.leaves {
-		// leafSelects only ever splits set operations; a single leaf therefore
-		// is the whole inner query, whose SQL we already rendered above. Reuse
-		// it to avoid a redundant Generate round-trip on the common path.
-		leafSQL := req.innerSQL
-		if len(req.leaves) > 1 {
-			leafSQL, err = generateStatement(client, leaf, req.cfg.dialect)
-			if err != nil {
-				return nil, err
-			}
-		}
-		if err := aggregateColumns(client, leafSQL, req.cfg, req.schema, req.tableCols); err != nil {
+	// Trace the complete query exactly once. Polyglot handles set operations
+	// natively, including their value and filter branches.
+	if req.innerSQL != "" {
+		if err := aggregateColumns(client, req.innerSQL, req.cfg, req.schema, req.tableCols); err != nil {
 			return nil, err
 		}
 	}
@@ -167,16 +153,11 @@ func LineageSourceColumns(sql string, opts ...LineageOption) (map[string][]strin
 	return sortedResult(req.tableCols), nil
 }
 
-// lineageRequest carries everything the per-leaf analysis loop needs. It is
-// produced once by prepareLineage and then consumed by both the serial
-// (LineageSourceColumns) and the concurrent (LineageSourceColumnsConcurrent)
-// drivers, so the two differ only in how they iterate the leaves — making the
-// serial-vs-concurrent benchmark an apples-to-apples comparison.
+// lineageRequest carries the setup for one full-query OpenLineage analysis.
 type lineageRequest struct {
 	cfg       lineageOptions
 	schema    *polyglot.ValidationSchema
 	innerSQL  string
-	leaves    []map[string]any
 	tableCols map[string]map[string]struct{}
 }
 
@@ -184,9 +165,8 @@ type lineageRequest struct {
 // driver: parse the statement, unwrap it to its inner query, render that query
 // back to SQL, build the validation schema, and seed every root physical source
 // table with an empty column set (so a table that contributes no flowing column
-// still appears in the result). The returned request's leaves are the leaf
-// SELECTs to analyze; a statement with no query at all yields zero leaves and an
-// empty (non-nil) result map.
+// still appears in the result). A statement with no query at all yields an empty
+// (non-nil) result map.
 func prepareLineage(client *polyglot.Client, sql string, opts ...LineageOption) (*lineageRequest, error) {
 	if client == nil {
 		return nil, errors.New("easysql: nil polyglot client")
@@ -216,7 +196,7 @@ func prepareLineage(client *polyglot.Client, sql string, opts ...LineageOption) 
 	if inner == nil {
 		// A statement with no query at all (e.g. CREATE TABLE (...) / DROP):
 		// nothing to analyze, so there are no source tables or columns. The
-		// drivers see zero leaves and return an empty result.
+		// driver returns an empty result.
 		return &lineageRequest{cfg: cfg, tableCols: map[string]map[string]struct{}{}}, nil
 	}
 
@@ -242,16 +222,15 @@ func prepareLineage(client *polyglot.Client, sql string, opts ...LineageOption) 
 		cfg:       cfg,
 		schema:    schema,
 		innerSQL:  innerSQL,
-		leaves:    leafSelects(inner),
 		tableCols: tableCols,
 	}, nil
 }
 
-// aggregateColumns runs OpenLineage column lineage for a single leaf SELECT and
-// folds its resolved (and heuristically resolved) source columns into tableCols.
+// aggregateColumns runs OpenLineage column lineage for a complete query and
+// folds its direct value-source columns into tableCols.
 func aggregateColumns(
 	client *polyglot.Client,
-	leafSQL string,
+	querySQL string,
 	cfg lineageOptions,
 	schema *polyglot.ValidationSchema,
 	tableCols map[string]map[string]struct{},
@@ -266,13 +245,16 @@ func aggregateColumns(
 		olOpts.Schema = schema
 	}
 
-	res, err := client.OpenLineageColumnLineage(leafSQL, olOpts)
+	res, err := client.OpenLineageColumnLineage(querySQL, olOpts)
 	if err != nil {
 		return fmt.Errorf("%w: column lineage failed: %v", ErrInternal, err)
 	}
 
-	// Fold each RESOLVED output field into tableCols: it maps to the source
-	// (table, column) pairs that produced it, when the input table is in scope.
+	// Fold only DIRECT input fields into tableCols. Set-operation right branches
+	// of INTERSECT/EXCEPT are reported as INDIRECT/FILTER by Polyglot: they
+	// decide whether a left value survives, but do not produce an output value.
+	// A source can be both DIRECT and FILTER for one output, so retain it whenever
+	// any transformation is DIRECT.
 	sourceless := false
 	for _, field := range res.Facet.Fields {
 		if len(field.InputFields) == 0 {
@@ -280,6 +262,9 @@ func aggregateColumns(
 		}
 		for _, in := range field.InputFields {
 			if in.Name == "" || in.Field == "" {
+				continue
+			}
+			if !hasDirectTransformation(in.Transformations) {
 				continue
 			}
 			scope, ok := resolveScopeTable(tableCols, in.Name)
@@ -295,28 +280,41 @@ func aggregateColumns(
 	// resolve, scalar-subquery aliases. The engine only exposes their output
 	// NAME (an alias like "c" or a synthetic "_0"), which is not a source
 	// column. Rather than crediting that phantom name, recover the REAL source
-	// columns that flow into the result by resolving the leaf's projections
+	// columns that flow into the result by resolving the query's projections
 	// structurally (recursing scalar subqueries, excluding filter positions).
 	if sourceless {
-		if err := creditFlowColumns(client, leafSQL, cfg, tableCols); err != nil {
+		if err := creditFlowColumns(client, querySQL, cfg, tableCols); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// creditFlowColumns resolves leafSQL's projection flow structurally and folds
+// hasDirectTransformation reports whether OpenLineage identifies an input as
+// contributing a value to the output. Inputs with only INDIRECT/FILTER
+// transformations remain represented by their seeded physical tables but do
+// not contribute source columns.
+func hasDirectTransformation(transformations []polyglot.OpenLineageTransformation) bool {
+	for _, transformation := range transformations {
+		if strings.EqualFold(strings.TrimSpace(transformation.Type), "DIRECT") {
+			return true
+		}
+	}
+	return false
+}
+
+// creditFlowColumns resolves querySQL's projection flow structurally and folds
 // the columns that reach the result into tableCols. It is used to recover the
 // real source columns of output fields the engine returns with no source column
 // (count(*), literals, unqualified aggregates, scalar-subquery aliases), keyed
 // on the actual referenced column rather than the fabricated output name.
 func creditFlowColumns(
 	client *polyglot.Client,
-	leafSQL string,
+	querySQL string,
 	cfg lineageOptions,
 	tableCols map[string]map[string]struct{},
 ) error {
-	stmt, err := parseFirstStatement(client, leafSQL, cfg.dialect)
+	stmt, err := parseFirstStatement(client, querySQL, cfg.dialect)
 	if err != nil {
 		return err
 	}
@@ -508,37 +506,6 @@ func innerQuery(stmt map[string]any) map[string]any {
 	return nil
 }
 
-// leafSelects flattens a query body into its leaf SELECT nodes, descending
-// through set operations (UNION / INTERSECT / EXCEPT). The OpenLineage engine
-// rejects set operations directly, so each branch is analyzed on its own and the
-// results are merged.
-func leafSelects(node map[string]any) []map[string]any {
-	// A parenthesized set-operation branch parses as a subquery wrapping a
-	// query body (e.g. `A UNION (B UNION C)` puts `(B UNION C)` under a
-	// subquery node). Unwrap it so its nested set operation is split into its
-	// own leaves too; otherwise the whole nested union is handed to the engine,
-	// which rejects a set operation.
-	if sub, ok := node["subquery"].(map[string]any); ok {
-		if inner, ok := sub["this"].(map[string]any); ok && queryBody(inner) != nil {
-			return leafSelects(inner)
-		}
-	}
-	for _, k := range setOpKeys {
-		if so, ok := node[k].(map[string]any); ok {
-			var leaves []map[string]any
-			for _, side := range setOpBranchKeys {
-				if branch, ok := so[side].(map[string]any); ok {
-					leaves = append(leaves, leafSelects(branch)...)
-				}
-			}
-			if len(leaves) > 0 {
-				return leaves
-			}
-		}
-	}
-	return []map[string]any{node}
-}
-
 // metadataToSchema converts the table->columns metadata into the Polyglot
 // validation schema used to expand wildcards and resolve columns. A name with
 // dots is split so the last segment is the table and the rest is the schema
@@ -559,7 +526,11 @@ func metadataToSchema(metadata map[string][]string) *polyglot.ValidationSchema {
 		cols := metadata[full]
 		columns := make([]polyglot.SchemaColumn, 0, len(cols))
 		for _, c := range cols {
-			columns = append(columns, polyglot.SchemaColumn{Name: c})
+			// Polyglot 0.8 parses every supplied type while building its
+			// resolver schema; an empty type causes the native parser to panic.
+			// Metadata has only names, so use a portable placeholder type. It
+			// affects neither wildcard expansion nor column lineage.
+			columns = append(columns, polyglot.SchemaColumn{Name: c, Type: "VARCHAR"})
 		}
 		schema.Tables = append(schema.Tables, polyglot.SchemaTable{
 			Schema:  schemaPart,

@@ -491,10 +491,14 @@ func (rr *refResolver) resolveQuery(q *queryNode, parent *scopeCtx) *resolvedOut
 	if q.Select != nil {
 		return rr.resolveSelect(q.Select, parent)
 	}
-	for _, so := range []*setOpBody{q.Union, q.Intersect, q.Except} {
-		if so != nil {
-			return rr.resolveSetOp(so, parent)
-		}
+	if q.Union != nil {
+		return rr.resolveSetOp(q.Union, parent, true)
+	}
+	if q.Intersect != nil {
+		return rr.resolveSetOp(q.Intersect, parent, false)
+	}
+	if q.Except != nil {
+		return rr.resolveSetOp(q.Except, parent, false)
 	}
 	return emptyOut()
 }
@@ -626,28 +630,34 @@ func (rr *refResolver) resolveSelect(sel *selectBody, parent *scopeCtx) *resolve
 
 // resolveSetOp resolves a UNION/INTERSECT/EXCEPT and merges its branches'
 // outputs positionally (the result takes the left branch's column names).
-func (rr *refResolver) resolveSetOp(body *setOpBody, parent *scopeCtx) *resolvedOut {
+// ReferencedColumns retains inputs from both branches, while lineage's
+// flow-only fallback keeps only the left value branch of INTERSECT/EXCEPT.
+func (rr *refResolver) resolveSetOp(body *setOpBody, parent *scopeCtx, rightValuesFlow bool) *resolvedOut {
 	ctx := rr.newScope(body.With, parent)
 	left := rr.resolveQuery(body.Left, ctx)
 	right := rr.resolveQuery(body.Right, ctx)
+	includeRight := !rr.flowOnly || rightValuesFlow
 
 	out := emptyOut()
 	out.names = append(out.names, left.names...)
 	for i, name := range left.names {
 		key := strings.ToLower(name)
 		refs := append([]colRef{}, left.byName[key]...)
-		if i < len(right.names) {
+		if includeRight && i < len(right.names) {
 			refs = append(refs, right.byName[strings.ToLower(right.names[i])]...)
 		}
 		out.byName[key] = refs
 	}
-	positionCount := max(len(left.positions), len(right.positions))
+	positionCount := len(left.positions)
+	if includeRight {
+		positionCount = max(positionCount, len(right.positions))
+	}
 	for i := 0; i < positionCount; i++ {
 		var refs []colRef
 		if i < len(left.positions) {
 			refs = append(refs, left.positions[i]...)
 		}
-		if i < len(right.positions) {
+		if includeRight && i < len(right.positions) {
 			refs = append(refs, right.positions[i]...)
 		}
 		out.addPosition(refs)

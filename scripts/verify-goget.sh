@@ -6,7 +6,8 @@
 # must be able to call the API, because the matching native FFI library ships
 # with the module and loads automatically on first use. This script creates a
 # throwaway consumer module, wires it up the way a real user would, and runs a
-# rewrite. It exits non-zero if the engine fails to load or misbehaves.
+# rewrite and a set-operation lineage analysis. It exits non-zero if the engine
+# fails to load or misbehaves.
 #
 # Modes:
 #   * Published (default): test the module as published on the proxy.
@@ -48,6 +49,23 @@ func main() {
 	}
 	if !strings.Contains(out, "WHERE") {
 		log.Fatalf("unexpected rewrite output, native engine misbehaving: %q", out)
+	}
+	lineage, err := easysql.LineageSourceColumns(
+		`SELECT id FROM value_source EXCEPT SELECT id FROM membership_filter`,
+		easysql.WithLineageDialect("trino"),
+		easysql.WithLineageMetadata(map[string][]string{
+			"value_source":      {"id"},
+			"membership_filter": {"id"},
+		}),
+	)
+	if err != nil {
+		log.Fatalf("set-operation lineage failed — the native engine did not load correctly: %v", err)
+	}
+	if got := lineage["value_source"]; len(got) != 1 || got[0] != "id" {
+		log.Fatalf("unexpected value-source lineage: %v", lineage)
+	}
+	if got := lineage["membership_filter"]; len(got) != 0 {
+		log.Fatalf("filter-only source leaked into lineage: %v", lineage)
 	}
 	fmt.Println("go-get verification OK:", out)
 }

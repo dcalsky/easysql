@@ -286,6 +286,98 @@ func TestLineageAcrossStatementTypes(t *testing.T) {
 	}
 }
 
+// TestLineageSetOperationValueAndFilterSemantics checks the full-query
+// OpenLineage behavior added in Polyglot 0.8. UNION branches both contribute
+// values, while INTERSECT/EXCEPT right branches are membership filters only.
+func TestLineageSetOperationValueAndFilterSemantics(t *testing.T) {
+	cases := []struct {
+		name     string
+		sql      string
+		expected map[string][]string
+	}{
+		{
+			name: "union_values_from_both_branches",
+			sql: `SELECT user_id FROM hive.raw.users
+				UNION
+				SELECT user_id FROM hive.raw.orders`,
+			expected: map[string][]string{
+				"hive.raw.orders": {"user_id"},
+				"hive.raw.users":  {"user_id"},
+			},
+		},
+		{
+			name: "union_all_values_from_both_branches",
+			sql: `SELECT user_id FROM hive.raw.users
+				UNION ALL
+				SELECT user_id FROM hive.raw.orders`,
+			expected: map[string][]string{
+				"hive.raw.orders": {"user_id"},
+				"hive.raw.users":  {"user_id"},
+			},
+		},
+		{
+			name: "except_right_branch_is_filter_only",
+			sql: `SELECT user_id FROM hive.raw.users
+				EXCEPT
+				SELECT user_id FROM hive.raw.orders`,
+			expected: map[string][]string{
+				"hive.raw.orders": {},
+				"hive.raw.users":  {"user_id"},
+			},
+		},
+		{
+			name: "intersect_right_branch_is_filter_only",
+			sql: `SELECT user_id FROM hive.raw.users
+				INTERSECT
+				SELECT user_id FROM hive.raw.orders`,
+			expected: map[string][]string{
+				"hive.raw.orders": {},
+				"hive.raw.users":  {"user_id"},
+			},
+		},
+		{
+			// The one native input has both DIRECT and INDIRECT/FILTER
+			// transformations. It must still be included as a value source.
+			name: "shared_source_with_direct_and_filter_transformations_flows",
+			sql: `SELECT user_id FROM hive.raw.users
+				EXCEPT
+				SELECT user_id FROM hive.raw.users`,
+			expected: map[string][]string{
+				"hive.raw.users": {"user_id"},
+			},
+		},
+		{
+			name: "parenthesized_nested_union_keeps_every_value_branch",
+			sql: `SELECT user_id FROM hive.raw.users
+				UNION
+				(SELECT user_id FROM hive.raw.orders
+				 UNION ALL
+				 SELECT order_id FROM hive.raw.payments)`,
+			expected: map[string][]string{
+				"hive.raw.orders":   {"user_id"},
+				"hive.raw.payments": {"order_id"},
+				"hive.raw.users":    {"user_id"},
+			},
+		},
+		{
+			name: "root_cte_referenced_by_each_union_branch",
+			sql: `WITH candidates AS (SELECT user_id FROM hive.raw.users)
+				SELECT user_id FROM candidates
+				UNION ALL
+				SELECT user_id FROM candidates`,
+			expected: map[string][]string{
+				"hive.raw.users": {"user_id"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertLineageSourceColumns(t, tc.name, tc.sql, tc.expected)
+		})
+	}
+}
+
 // TestLineagePlainSelectMatchesEquivalentCreateView is a focused regression for
 // the requirement that a bare SELECT is analyzed just like its CREATE VIEW
 // wrapper: both must yield the same source columns.
@@ -566,10 +658,11 @@ func TestBughuntFilterOnlyAndFlowSemantics(t *testing.T) {
 			},
 		},
 		{
-			// INTERSECT / EXCEPT branches are merged like UNION.
-			"except_merges_branches",
+			// EXCEPT's right branch only filters left values: it remains in the
+			// result as a physical source table but contributes no value column.
+			"except_right_branch_is_filter_only",
 			`SELECT user_id FROM hive.raw.users EXCEPT SELECT user_id FROM hive.raw.orders`,
-			map[string][]string{"hive.raw.orders": {"user_id"}, "hive.raw.users": {"user_id"}},
+			map[string][]string{"hive.raw.orders": {}, "hive.raw.users": {"user_id"}},
 		},
 		{
 			// Qualified wildcard expands only its own table via metadata; the
@@ -687,65 +780,6 @@ func TestBughuntProducerNamespaceDoNotAffectResult(t *testing.T) {
 		if !reflect.DeepEqual(got, base) {
 			t.Fatalf("producer/namespace changed the result (doc: provenance only):\n base: %v\n got:  %v", base, got)
 		}
-	}
-}
-
-// TestBughuntConcurrentMatchesSerialProperty is the batch property test for d6:
-// for a diverse set of statements (single SELECT, wide UNIONs, CTEs, wrapping
-// statements, error cases) the concurrent driver must return exactly what the
-// serial driver returns — same result or same error disposition.
-func TestBughuntConcurrentMatchesSerialProperty(t *testing.T) {
-	queries := []string{
-		`SELECT user_id, user_name FROM hive.raw.users`,
-		`SELECT * FROM hive.raw.orders`,
-		`SELECT count(*) AS c FROM hive.raw.orders`, // exercises the unresolved-column heuristic
-		`SELECT user_id FROM hive.raw.users UNION SELECT user_id FROM hive.raw.orders`,
-		`SELECT user_id FROM hive.raw.users UNION ALL SELECT user_id FROM hive.raw.orders UNION ALL SELECT order_id FROM hive.raw.payments`,
-		`SELECT user_id FROM hive.raw.users INTERSECT SELECT user_id FROM hive.raw.orders`,
-		`SELECT user_id FROM hive.raw.users EXCEPT SELECT user_id FROM hive.raw.orders`,
-		buildUnionSQL(2),
-		buildUnionSQL(5),
-		buildUnionSQL(9),
-		`WITH c AS (SELECT user_id FROM hive.raw.users UNION SELECT user_id FROM hive.raw.orders) SELECT user_id FROM c`,
-		`CREATE VIEW hive.x.v AS SELECT u.user_id FROM hive.raw.users u UNION SELECT o.user_id FROM hive.raw.orders o`,
-		`INSERT INTO hive.x.t SELECT o.amount FROM hive.raw.orders o WHERE o.status = 'X'`,
-		`DROP TABLE hive.x.t`, // zero-leaf path
-		`SELECT user_id FROM hive.raw.users UNION (SELECT user_id FROM hive.raw.orders UNION SELECT order_id FROM hive.raw.payments)`,
-	}
-	for i, sql := range queries {
-		got, err := bughuntBoth(t, sql, WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata))
-		// bughuntBoth already asserted serial == concurrent (result and error
-		// disposition); nothing further to check per query.
-		t.Logf("query[%d]: err=%v result=%v", i, err, got)
-	}
-}
-
-// TestBughuntConcurrentRaceSafety hammers LineageSourceColumnsConcurrent from
-// parallel goroutines (run under -race) on a wide UNION so the multi-leaf
-// concurrent path is exercised, and checks every call returns the same result.
-func TestBughuntConcurrentRaceSafety(t *testing.T) {
-	sql := buildUnionSQL(8)
-	want, err := LineageSourceColumns(sql, WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata))
-	if err != nil {
-		t.Fatalf("serial baseline: %v", err)
-	}
-	if len(want) == 0 {
-		t.Fatal("serial baseline unexpectedly empty")
-	}
-	for i := 0; i < 8; i++ {
-		t.Run("worker", func(t *testing.T) {
-			t.Parallel()
-			for j := 0; j < 3; j++ {
-				got, err := LineageSourceColumnsConcurrent(sql,
-					WithLineageDialect("trino"), WithLineageMetadata(trinoMetadata))
-				if err != nil {
-					t.Fatalf("concurrent: %v", err)
-				}
-				if !reflect.DeepEqual(got, want) {
-					t.Fatalf("nondeterministic result under parallel use:\n want: %v\n got:  %v", want, got)
-				}
-			}
-		})
 	}
 }
 

@@ -24,6 +24,12 @@
 
 #define STATUS_SERIALIZATION_ERROR 6
 
+#define STATUS_COLUMN_NOT_FOUND 7
+
+#define STATUS_COLUMN_INDETERMINATE 8
+
+#define STATUS_COLUMN_AMBIGUOUS 9
+
 #define STATUS_INTERNAL_ERROR 99
 
 /**
@@ -178,6 +184,31 @@ polyglot_result_t polyglot_lineage_with_schema(const char *column_name,
                                                const char *sql,
                                                const char *schema_json,
                                                const char *dialect);
+
+/**
+ * Trace lineage for a zero-based output ordinal.
+ */
+polyglot_result_t polyglot_lineage_at(uintptr_t ordinal, const char *sql, const char *dialect);
+
+/**
+ * Trace lineage for a zero-based output ordinal using schema metadata.
+ */
+polyglot_result_t polyglot_lineage_at_with_schema(uintptr_t ordinal,
+                                                  const char *sql,
+                                                  const char *schema_json,
+                                                  const char *dialect);
+
+/**
+ * Describe the query's ordered output columns.
+ */
+polyglot_result_t polyglot_output_columns(const char *sql, const char *dialect);
+
+/**
+ * Describe ordered output columns after schema-aware wildcard expansion.
+ */
+polyglot_result_t polyglot_output_columns_with_schema(const char *sql,
+                                                      const char *schema_json,
+                                                      const char *dialect);
 
 /**
  * Get source tables that contribute to a column.
