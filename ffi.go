@@ -17,7 +17,9 @@
 package easysql
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -36,6 +38,22 @@ const ffiDirName = ".ffi"
 // otherwise non-standard native library; loading a mismatched library is
 // unsupported and may crash or produce wrong results.
 const versionCheckSkipEnv = "EASYSQL_SKIP_FFI_VERSION_CHECK"
+
+// integrityCheckSkipEnv disables the pre-load digest check for advanced users
+// deliberately replacing a bundled artifact. This is unsupported: native code
+// is loaded into the current process, so bypassing integrity verification must
+// be an explicit opt-in distinct from the version check.
+const integrityCheckSkipEnv = "EASYSQL_SKIP_FFI_INTEGRITY_CHECK"
+
+// bundledFFISHA256 pins the exact native artifacts shipped with this module.
+// Checking before polyglot.Open is load-bearing: a post-load RuntimeVersion
+// check cannot protect against a malicious library because its initialization
+// code has already executed by then.
+var bundledFFISHA256 = map[string]string{
+	"polyglot-sql-ffi-macos-aarch64":  "aedf843b09640b933926e5688ad68c5831a69511c983bfab8e4a49b07ab5a299",
+	"polyglot-sql-ffi-linux-x86_64":   "1b663343cb0b104391ed922911475d17f918ab2023b4cc8dca524e94933a1fbb",
+	"polyglot-sql-ffi-windows-x86_64": "a0f90b8569c242a3c17b8efe127d2d41e2cd580c3e1b7c9edb65237ee0f7f180",
+}
 
 // The process-wide SQL engine. It is opened lazily, exactly once, the first time
 // any API needs it (or eagerly via Init), and then shared by every call. The
@@ -90,6 +108,9 @@ func openBundledClient() (*polyglot.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := verifyBundledFFIIntegrity(path); err != nil {
+		return nil, err
+	}
 	client, err := polyglot.Open(path)
 	if err != nil {
 		return nil, err
@@ -99,6 +120,42 @@ func openBundledClient() (*polyglot.Client, error) {
 		return nil, err
 	}
 	return client, nil
+}
+
+// verifyBundledFFIIntegrity authenticates the selected artifact before any
+// native code is loaded. ffiSearchRoots includes the working-directory ancestry
+// for deployed binaries whose build-time module cache is unavailable, so path
+// location alone is not a sufficient trust boundary.
+func verifyBundledFFIIntegrity(path string) error {
+	if strings.TrimSpace(os.Getenv(integrityCheckSkipEnv)) != "" {
+		return nil
+	}
+	platform, err := ffiPlatformDir()
+	if err != nil {
+		return err
+	}
+	want, ok := bundledFFISHA256[platform]
+	if !ok || want == "" {
+		return fmt.Errorf("easysql: no trusted FFI digest for platform %q", platform)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("easysql: cannot open bundled FFI for integrity check: %w", err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("easysql: cannot hash bundled FFI: %w", err)
+	}
+	got := fmt.Sprintf("%x", h.Sum(nil))
+	if got != want {
+		return fmt.Errorf(
+			"easysql: bundled FFI integrity check failed for %q: SHA-256 %s, want %s; "+
+				"restore the artifact shipped with this module (or set %s=1 to bypass, unsupported)",
+			path, got, want, integrityCheckSkipEnv,
+		)
+	}
+	return nil
 }
 
 // verifyFFIVersion fails closed when the loaded native library's version does
@@ -140,7 +197,9 @@ func bundledFFIPath() (string, error) {
 	for _, root := range ffiSearchRoots() {
 		candidate := filepath.Join(root, ffiDirName, platform, libName)
 		tried = append(tried, candidate)
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+		// Never follow a same-named symlink into an arbitrary native library.
+		// Integrity is checked separately before the regular file is loaded.
+		if info, err := os.Lstat(candidate); err == nil && info.Mode().IsRegular() {
 			return candidate, nil
 		}
 	}
@@ -191,9 +250,12 @@ func ffiLibraryFileName() string {
 	}
 }
 
-// ffiSearchRoots lists candidate directories that may contain the .ffi/ folder,
-// walking up from both the working directory and this source file's directory so
-// the lookup works regardless of where a test or binary is run from.
+// ffiSearchRoots lists candidate directories that may contain the .ffi/ folder.
+// An absolute build-time source location is preferred over the runtime working
+// directory so an adjacent, module-owned artifact wins whenever it is present.
+// Working-directory ancestors remain a compatibility fallback for deployed
+// binaries whose build-time module cache is unavailable; their artifacts still
+// have to pass the pre-load digest check.
 func ffiSearchRoots() []string {
 	var roots []string
 	seen := map[string]bool{}
@@ -215,11 +277,13 @@ func ffiSearchRoots() []string {
 		}
 	}
 
+	if _, file, _, ok := runtime.Caller(0); ok {
+		if filepath.IsAbs(file) {
+			addAncestors(filepath.Dir(file))
+		}
+	}
 	if wd, err := os.Getwd(); err == nil {
 		addAncestors(wd)
-	}
-	if _, file, _, ok := runtime.Caller(0); ok {
-		addAncestors(filepath.Dir(file))
 	}
 	return roots
 }

@@ -351,6 +351,18 @@ func TestBindCTEsQuotesBindingName(t *testing.T) {
 	}
 }
 
+func TestBindCTEsPreservesMixedCaseBindingName(t *testing.T) {
+	out := bindCTEsValid(t, "postgres",
+		`SELECT * FROM "Foo"`,
+		[]CTEBinding{{Name: "Foo", Query: `SELECT id FROM orders`}},
+	)
+
+	const want = `WITH "Foo" AS (SELECT id FROM orders) SELECT * FROM "Foo"`
+	if out != want {
+		t.Fatalf("mixed-case binding changed identity:\nwant: %s\n got: %s", want, out)
+	}
+}
+
 func TestBindCTEsSupportsAllRewriteDialects(t *testing.T) {
 	for _, dialect := range []string{"mysql", "starrocks", "postgres", "trino"} {
 		t.Run(dialect, func(t *testing.T) {

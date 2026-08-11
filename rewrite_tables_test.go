@@ -2,6 +2,7 @@ package easysql
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -105,5 +106,71 @@ func TestRewriteTableReferencesRejectsMultipleStatements(t *testing.T) {
 	)
 	if !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("expected ErrUnsupported for multiple statements, got %v", err)
+	}
+}
+
+func TestRewriteTableReferencesRejectsInvalidPlan(t *testing.T) {
+	validUnion := func() *UnionRewrite {
+		return &UnionRewrite{
+			TableAlias: "t",
+			Columns:    []string{"c"},
+			Branches:   []TableRef{{Schema: "safe", Table: "t"}},
+		}
+	}
+	tests := []struct {
+		name     string
+		spec     TableRewrite
+		contains string
+	}{
+		{
+			name:     "unqualified match key",
+			spec:     TableRewrite{MatchKey: "t", Inline: &TableRef{Schema: "safe", Table: "t"}},
+			contains: "must be schema.table",
+		},
+		{
+			name:     "overqualified match key",
+			spec:     TableRewrite{MatchKey: "cat.s.t", Inline: &TableRef{Schema: "safe", Table: "t"}},
+			contains: "must be schema.table",
+		},
+		{
+			name:     "no target",
+			spec:     TableRewrite{MatchKey: "s.t"},
+			contains: "exactly one target",
+		},
+		{
+			name: "catalog without schema",
+			spec: TableRewrite{
+				MatchKey: "s.t",
+				Inline:   &TableRef{Catalog: "cat", Table: "t"},
+			},
+			contains: "catalog requires a schema",
+		},
+		{
+			name: "empty union column",
+			spec: func() TableRewrite {
+				u := validUnion()
+				u.Columns = []string{""}
+				return TableRewrite{MatchKey: "s.t", Union: u}
+			}(),
+			contains: "column 0 must not be empty",
+		},
+		{
+			name: "union branch catalog without schema",
+			spec: func() TableRewrite {
+				u := validUnion()
+				u.Branches = []TableRef{{Catalog: "cat", Table: "t"}}
+				return TableRewrite{MatchKey: "s.t", Union: u}
+			}(),
+			contains: "catalog requires a schema",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := RewriteTableReferences("SELECT * FROM s.t", []TableRewrite{tt.spec})
+			if err == nil || !strings.Contains(err.Error(), tt.contains) {
+				t.Fatalf("want error containing %q, got %v", tt.contains, err)
+			}
+		})
 	}
 }

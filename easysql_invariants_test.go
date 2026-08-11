@@ -152,6 +152,115 @@ func TestInputGuard(t *testing.T) {
 	}
 }
 
+func TestInputGuardCoversEveryPublicParsePath(t *testing.T) {
+	deepExpr := strings.Repeat("(", maxBracketDepth+1) + "1" +
+		strings.Repeat(")", maxBracketDepth+1)
+	deepSQL := "SELECT " + deepExpr + " FROM s.t"
+
+	checks := []struct {
+		name string
+		call func() error
+	}{
+		{"LineageSourceColumns", func() error {
+			_, err := LineageSourceColumns(deepSQL)
+			return err
+		}},
+		{"LineageSourceColumnsConcurrent", func() error {
+			_, err := LineageSourceColumnsConcurrent(deepSQL)
+			return err
+		}},
+		{"ParseColumns", func() error {
+			_, err := ParseColumns(deepSQL)
+			return err
+		}},
+		{"ReferencedColumns", func() error {
+			_, err := ReferencedColumns(deepSQL)
+			return err
+		}},
+		{"ReferencedColumnUsages", func() error {
+			_, err := ReferencedColumnUsages(deepSQL)
+			return err
+		}},
+		{"RewriteTableReferences", func() error {
+			_, err := RewriteTableReferences(deepSQL, []TableRewrite{{
+				MatchKey: "s.t",
+				Inline:   &TableRef{Schema: "safe", Table: "t"},
+			}})
+			return err
+		}},
+		{"BindCTEs", func() error {
+			_, err := BindCTEs(deepSQL, []CTEBinding{{Name: "bound", Query: "SELECT 1"}})
+			return err
+		}},
+	}
+
+	for _, check := range checks {
+		t.Run(check.name, func(t *testing.T) {
+			if err := check.call(); !errors.Is(err, ErrUnsupported) {
+				t.Fatalf("deep input must be rejected with ErrUnsupported, got %v", err)
+			}
+		})
+	}
+
+	t.Run("ApplyRowFilter predicate", func(t *testing.T) {
+		_, err := ApplyRowFilter("SELECT * FROM t", deepExpr)
+		if !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("deep predicate must be rejected with ErrUnsupported, got %v", err)
+		}
+	})
+}
+
+func TestNilFunctionalOptionsReturnErrors(t *testing.T) {
+	checks := []struct {
+		name string
+		call func() error
+	}{
+		{"ApplyRowFilter", func() error {
+			_, err := ApplyRowFilter("SELECT * FROM t", "x = 1", Option(nil))
+			return err
+		}},
+		{"BindCTEs", func() error {
+			_, err := BindCTEs("SELECT * FROM bound", []CTEBinding{{Name: "bound", Query: "SELECT 1"}}, BindCTEOption(nil))
+			return err
+		}},
+		{"LineageSourceColumns", func() error {
+			_, err := LineageSourceColumns("SELECT x FROM t", LineageOption(nil))
+			return err
+		}},
+		{"LineageSourceColumnsConcurrent", func() error {
+			_, err := LineageSourceColumnsConcurrent("SELECT x FROM t", LineageOption(nil))
+			return err
+		}},
+		{"ParseColumns", func() error {
+			_, err := ParseColumns("SELECT x FROM t", LineageOption(nil))
+			return err
+		}},
+		{"ReferencedColumns", func() error {
+			_, err := ReferencedColumns("SELECT x FROM t", LineageOption(nil))
+			return err
+		}},
+		{"ReferencedColumnUsages", func() error {
+			_, err := ReferencedColumnUsages("SELECT x FROM t", LineageOption(nil))
+			return err
+		}},
+		{"RewriteTableReferences", func() error {
+			_, err := RewriteTableReferences("SELECT * FROM s.t", []TableRewrite{{
+				MatchKey: "s.t",
+				Inline:   &TableRef{Schema: "safe", Table: "t"},
+			}}, RewriteTablesOption(nil))
+			return err
+		}},
+	}
+
+	for _, check := range checks {
+		t.Run(check.name, func(t *testing.T) {
+			if err := check.call(); err == nil {
+				t.Fatal("nil option must return an error")
+			}
+		})
+	}
+}
+
 func TestRewriteInvariants(t *testing.T) {
 	for _, tc := range invariantCorpus {
 		pg := dialectToPolyglot[tc.dialect]
