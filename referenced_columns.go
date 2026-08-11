@@ -312,11 +312,10 @@ func analyzeReferencedColumns(
 		return nil, errors.New("easysql: nil polyglot client")
 	}
 
-	cfg := lineageOptions{dialect: "trino", producer: lineageProducer, namespace: lineageNamespace}
-	for _, o := range opts {
-		o(&cfg)
+	cfg, err := configuredLineageOptions(opts...)
+	if err != nil {
+		return nil, err
 	}
-	cfg.dialect = normalizeLineageDialect(cfg.dialect)
 
 	stmt, err := parseFirstStatement(client, sql, cfg.dialect)
 	if err != nil {
@@ -1137,40 +1136,73 @@ func resolveQualifiedPhysical(qualifier, name string, ctx *scopeCtx) []colRef {
 }
 
 func (rr *refResolver) resolveUnqualified(name string, ctx *scopeCtx) []colRef {
-	if name == "" {
+	if name == "" || ctx == nil {
 		return nil
 	}
 	var refs []colRef
-	matched := false
+	var unknownRoots []string
 
 	// Derived sources that expose the name resolve through to their roots.
 	for _, s := range ctx.sources {
 		if s.kind == srcDerived {
 			if r, ok := s.out.byName[strings.ToLower(name)]; ok {
 				refs = append(refs, r...)
-				matched = true
+				continue
+			}
+			// An unexpanded star means the derived source may expose this name;
+			// retain its roots for the same fail-open treatment as a physical
+			// source whose metadata is unknown.
+			if _, unknown := s.out.byName["*"]; unknown {
+				unknownRoots = append(unknownRoots, s.roots...)
 			}
 		}
 	}
 
 	phys := physicalSources(ctx)
-	// Single unambiguous physical source: attribute directly.
-	if !matched && len(phys) == 1 && len(ctx.sources) == 1 {
-		return []colRef{{phys[0].table, name}}
-	}
-
 	for _, s := range phys {
-		if cols, ok := lookupMetadataColumns(rr.metadata, s.table); ok && containsString(cols, name) {
+		cols, known := lookupMetadataColumns(rr.metadata, s.table)
+		if !known {
+			unknownRoots = append(unknownRoots, s.table)
+			continue
+		}
+		if containsString(cols, name) {
 			refs = append(refs, colRef{s.table, name})
-			matched = true
 		}
 	}
-	if matched {
+	// Unknown current-scope schemas can legally contain the name and therefore
+	// participate alongside known matches. Attribute to them conservatively.
+	refs = append(refs, refsForRoots(distinctStrings(unknownRoots), name)...)
+	if len(refs) > 0 {
 		return refs
 	}
-	// Unresolved (no metadata, or metadata silent on this column): attribute to
-	// every source root in scope rather than dropping it (safe superset).
+
+	// Every current source had metadata (or a fully known derived output) and
+	// none exposed the name. SQL correlation then resolves against enclosing
+	// scopes; consult them before applying the final fail-open fallback.
+	if ctx.parent != nil {
+		if parentRefs := rr.resolveUnqualified(name, ctx.parent); len(parentRefs) > 0 {
+			return parentRefs
+		}
+	}
+	// The name is unresolved even across the correlation chain. Keep the API's
+	// fail-open guarantee by attributing it to every root in the current scope.
 	return refsForRoots(scopeRoots(ctx), name)
+}
+
+func distinctStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func physicalSources(ctx *scopeCtx) []*source {
@@ -1339,6 +1371,156 @@ func (rr *refResolver) resolveMerge(mrg *mergeNode) {
 	}
 	rr.collect(mrg.On, ctx, ColumnClauseMergeOn)
 	rr.collect(mrg.Whens, ctx, ColumnClauseMergeWhen)
+}
+
+// lineageDMLValueColumns provides the structural value-flow path used by
+// LineageSourceColumns for UPDATE and MERGE. Polyglot's OpenLineage endpoint
+// rejects those statement roots, but their assignment-value ASTs can reuse the
+// same scope resolver as ReferencedColumns without crediting filter clauses.
+func lineageDMLValueColumns(
+	stmt map[string]any,
+	metadata map[string][]string,
+) (map[string]map[string]struct{}, bool, error) {
+	var st statement
+	if err := decodeNode(stmt, &st); err != nil {
+		return nil, false, err
+	}
+	rr := &refResolver{
+		metadata: metadata,
+		result:   map[string]map[string]struct{}{},
+		flowOnly: true,
+	}
+	switch {
+	case st.Update != nil:
+		rr.resolveUpdateValueFlow(st.Update)
+		return rr.result, true, nil
+	case st.Merge != nil:
+		rr.resolveMergeValueFlow(st.Merge)
+		return rr.result, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func (rr *refResolver) resolveUpdateValueFlow(upd *updateNode) {
+	ctx := rr.newScope(upd.With, nil)
+	rr.addTable(upd.Table, ctx)
+	if upd.FromClause != nil {
+		for _, sourceExpr := range upd.FromClause.Expressions {
+			rr.addSource(sourceExpr, ctx)
+		}
+	}
+	for _, join := range upd.FromJoins {
+		rr.addSource(join.This, ctx)
+	}
+	for _, pair := range upd.Set {
+		for i := 1; i < len(pair); i++ {
+			rr.recordFlowRefs(rr.collectRefs(pair[i], ctx, ColumnClauseUpdateSetValue))
+		}
+	}
+}
+
+func (rr *refResolver) resolveMergeValueFlow(mrg *mergeNode) {
+	ctx := rr.newScope(mrg.With, nil)
+	rr.addSource(mrg.This, ctx)
+	rr.addSource(mrg.Using, ctx)
+	for _, value := range mergeAssignmentValues(mrg.Whens) {
+		rr.recordFlowRefs(rr.collectRefs(value, ctx, ColumnClauseMergeWhen))
+	}
+}
+
+func (rr *refResolver) recordFlowRefs(refs []colRef) {
+	for _, ref := range refs {
+		if ref.table == "" || ref.col == "" || ref.col == "*" {
+			continue
+		}
+		ensureSet(rr.result, ref.table)[ref.col] = struct{}{}
+	}
+}
+
+// mergeAssignmentValues extracts only values written by MERGE actions. WHEN
+// conditions and target identifiers are deliberately excluded: they choose
+// rows or destinations but do not produce assigned values.
+func mergeAssignmentValues(whens expr) []expr {
+	root, ok := decodeObj(whens)
+	if !ok {
+		return nil
+	}
+	body, ok := decodeObj(root["whens"])
+	if !ok {
+		return nil
+	}
+	var values []expr
+	for _, rawWhen := range decodeArr(body["expressions"]) {
+		wrapper, ok := decodeObj(rawWhen)
+		if !ok {
+			continue
+		}
+		when, ok := decodeObj(wrapper["when"])
+		if !ok {
+			continue
+		}
+		then, ok := decodeObj(when["then"])
+		if !ok {
+			continue
+		}
+		tuple, ok := decodeObj(then["tuple"])
+		if !ok {
+			continue
+		}
+		parts := decodeArr(tuple["expressions"])
+		if len(parts) < 2 {
+			continue
+		}
+		switch mergeActionName(parts[0]) {
+		case "UPDATE":
+			assignments, ok := decodeObj(parts[1])
+			if !ok {
+				continue
+			}
+			assignmentTuple, ok := decodeObj(assignments["tuple"])
+			if !ok {
+				continue
+			}
+			for _, assignment := range decodeArr(assignmentTuple["expressions"]) {
+				assignmentObj, ok := decodeObj(assignment)
+				if !ok {
+					continue
+				}
+				eq, ok := decodeObj(assignmentObj["eq"])
+				if ok && len(eq["right"]) > 0 {
+					values = append(values, eq["right"])
+				}
+			}
+		case "INSERT":
+			// INSERT actions encode target columns in the penultimate tuple and
+			// assigned values in the final tuple.
+			valueWrapper, ok := decodeObj(parts[len(parts)-1])
+			if !ok {
+				continue
+			}
+			valueTuple, ok := decodeObj(valueWrapper["tuple"])
+			if !ok {
+				continue
+			}
+			values = append(values, decodeArr(valueTuple["expressions"])...)
+		}
+	}
+	return values
+}
+
+func mergeActionName(action expr) string {
+	wrapper, ok := decodeObj(action)
+	if !ok {
+		return ""
+	}
+	var actionVar struct {
+		This string `json:"this"`
+	}
+	if decodeInto(wrapper["var"], &actionVar) != nil {
+		return ""
+	}
+	return strings.ToUpper(actionVar.This)
 }
 
 // ----------------------------------------------------------------------------

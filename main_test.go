@@ -26,9 +26,9 @@ func TestMain(m *testing.M) {
 	// does; tests also use this client directly for AST assertions.
 	c, err := defaultClient()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "skipping easysql tests: polyglot FFI library not available:", err)
-		fmt.Fprintln(os.Stderr, "ensure the matching .ffi/ artifact for this platform is present to run them")
-		os.Exit(0)
+		fmt.Fprintln(os.Stderr, "cannot run easysql tests: polyglot FFI library is unavailable or untrusted:", err)
+		fmt.Fprintln(os.Stderr, "ensure the matching, unmodified .ffi artifact for this platform is present")
+		os.Exit(1)
 	}
 	testClient = c
 	os.Exit(m.Run())

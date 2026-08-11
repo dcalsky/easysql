@@ -122,10 +122,30 @@ func WithLineageMetadata(metadata map[string][]string) LineageOption {
 	return func(o *lineageOptions) { o.metadata = metadata }
 }
 
+func configuredLineageOptions(opts ...LineageOption) (lineageOptions, error) {
+	cfg := lineageOptions{dialect: "trino", producer: lineageProducer, namespace: lineageNamespace}
+	for i, opt := range opts {
+		if opt == nil {
+			return lineageOptions{}, fmt.Errorf("easysql: lineage option %d must not be nil", i)
+		}
+		opt(&cfg)
+	}
+	cfg.dialect = normalizeLineageDialect(cfg.dialect)
+	if strings.TrimSpace(cfg.producer) == "" {
+		cfg.producer = lineageProducer
+	}
+	if strings.TrimSpace(cfg.namespace) == "" {
+		cfg.namespace = lineageNamespace
+	}
+	return cfg, nil
+}
+
 // LineageSourceColumns returns, for each physical source table referenced by sql,
 // the sorted list of source columns that flow into the statement's result. It
 // works for any statement that contains a query (SELECT, UNION, CREATE VIEW,
-// CREATE TABLE AS, INSERT ... SELECT, ...).
+// CREATE TABLE AS, INSERT ... SELECT, ...). UPDATE assignment values and MERGE
+// UPDATE/INSERT values are also resolved structurally, including values sourced
+// through CTEs or derived tables.
 //
 // It is the Go equivalent of the Python `get_source_table_columns`. The result
 // keys are the fully-qualified table names as resolved by the analyzer (e.g.
@@ -172,16 +192,9 @@ func prepareLineage(client *polyglot.Client, sql string, opts ...LineageOption) 
 		return nil, errors.New("easysql: nil polyglot client")
 	}
 
-	cfg := lineageOptions{dialect: "trino", producer: lineageProducer, namespace: lineageNamespace}
-	for _, o := range opts {
-		o(&cfg)
-	}
-	cfg.dialect = normalizeLineageDialect(cfg.dialect)
-	if strings.TrimSpace(cfg.producer) == "" {
-		cfg.producer = lineageProducer
-	}
-	if strings.TrimSpace(cfg.namespace) == "" {
-		cfg.namespace = lineageNamespace
+	cfg, err := configuredLineageOptions(opts...)
+	if err != nil {
+		return nil, err
 	}
 
 	stmt, err := parseFirstStatement(client, sql, cfg.dialect)
@@ -194,6 +207,15 @@ func prepareLineage(client *polyglot.Client, sql string, opts ...LineageOption) 
 	// is its own body. Column lineage is computed for all of them alike.
 	inner := innerQuery(stmt)
 	if inner == nil {
+		// Polyglot does not expose OpenLineage for UPDATE/MERGE, even when their
+		// assigned values come from query-bearing CTEs or derived tables. Resolve
+		// those value positions structurally so a real source flow is not silently
+		// reported as empty. Filter-only ON/WHERE/WHEN columns stay excluded.
+		if tableCols, handled, err := lineageDMLValueColumns(stmt, cfg.metadata); err != nil {
+			return nil, err
+		} else if handled {
+			return &lineageRequest{cfg: cfg, tableCols: tableCols}, nil
+		}
 		// A statement with no query at all (e.g. CREATE TABLE (...) / DROP):
 		// nothing to analyze, so there are no source tables or columns. The
 		// driver returns an empty result.
@@ -449,6 +471,13 @@ func sourceTables(client *polyglot.Client, querySQL, dialect string) ([]string, 
 
 // parseFirstStatement parses sql and returns the first statement node.
 func parseFirstStatement(client *polyglot.Client, sql, dialect string) (map[string]any, error) {
+	// All analysis APIs share this parse entry point. Keep the same native-parser
+	// safety boundary as the rewrite APIs; without it, ParseColumns and the
+	// lineage/reference APIs could accept inputs that ApplyRowFilter correctly
+	// rejects as too large or deeply nested.
+	if err := guardInput(sql); err != nil {
+		return nil, err
+	}
 	raw, err := client.Parse(sql, dialect)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrParse, err)

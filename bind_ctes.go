@@ -53,7 +53,10 @@ func BindCTEs(consumerSQL string, bindings []CTEBinding, opts ...BindCTEOption) 
 	}
 
 	cfg := bindCTEConfig{dialect: "trino"}
-	for _, opt := range opts {
+	for i, opt := range opts {
+		if opt == nil {
+			return "", fmt.Errorf("easysql: CTE binding option %d must not be nil", i)
+		}
 		opt(&cfg)
 	}
 	if strings.TrimSpace(cfg.dialect) == "" {
@@ -82,7 +85,10 @@ func BindCTEs(consumerSQL string, bindings []CTEBinding, opts ...BindCTEOption) 
 			return "", fmt.Errorf("%w: combined CTE input too large (more than %d bytes)", ErrUnsupported, maxInputBytes)
 		}
 		totalInputBytes += len(binding.Query)
-		key := normName(name, needsQuote(name))
+		// Preserve the API's established duplicate rule: simple identifier values
+		// compare like unquoted SQL names (case-insensitively), even though the
+		// generator quotes mixed case below to preserve an accepted name exactly.
+		key := normName(name, !simpleIdentRe.MatchString(name))
 		if _, exists := bindingNames[key]; exists {
 			return "", fmt.Errorf("easysql: duplicate CTE binding %q", name)
 		}

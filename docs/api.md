@@ -81,6 +81,9 @@ column.
 - CTEs and derived subqueries are resolved to physical sources.
 - Statements containing a query are supported, including bare `SELECT`/`UNION`,
   `CREATE VIEW`, `CREATE TABLE AS SELECT`, and `INSERT ... SELECT`.
+- `UPDATE` assignment values and `MERGE` update/insert values are resolved
+  structurally, including values sourced through CTEs and derived tables;
+  `WHERE`, `ON`, and `WHEN` conditions remain filter-only.
 - Metadata expands `*` and resolves ambiguous unqualified columns. Metadata for
   tables outside the query is ignored.
 

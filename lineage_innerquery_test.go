@@ -217,30 +217,24 @@ func TestInnerQueryUnwrapCoverage(t *testing.T) {
 
 // TestInnerQueryUnsupportedShapes pins down the statements innerQuery does NOT
 // unwrap today, returning nil (and so making LineageSourceColumns yield an empty
-// result rather than an engine error). Two groups:
-//
-//   - "correctly empty": statements with no source query that flows into a
-//     result — INSERT ... VALUES, CREATE TABLE (...) / LIKE, and subqueries that
-//     sit only in a filter position (DELETE ... WHERE IN, UPDATE ... SET = (..)).
-//   - "known gaps": MERGE ... USING (SELECT) and UPDATE ... FROM (SELECT) embed
-//     a source query that DOES flow into a write target, but it is nested too
-//     deep for innerQuery's shallow scan, so lineage is silently empty. If
-//     innerQuery is ever extended to cover these, move the case to
-//     TestInnerQueryUnwrapCoverage.
+// result rather than an engine error). Statements with no value-producing query
+// remain empty. UPDATE/MERGE cannot be unwrapped as one query and are rejected by
+// Polyglot's OpenLineage endpoint, so their assignment values use the structural
+// DML fallback and still report the exact value-source columns.
 func TestInnerQueryUnsupportedShapes(t *testing.T) {
 	cases := []struct {
-		name    string
-		dialect string
-		sql     string
-		gap     bool // true = a real gap (source flows into a write target)
+		name     string
+		dialect  string
+		sql      string
+		expected map[string][]string
 	}{
-		{"insert_values", "trino", `INSERT INTO hive.x.t VALUES (1, 'a')`, false},
-		{"create_table_columns", "trino", `CREATE TABLE hive.x.t (id BIGINT, name VARCHAR)`, false},
-		{"create_table_like", "trino", `CREATE TABLE hive.x.t (LIKE hive.raw.orders)`, false},
-		{"delete_where_subquery", "trino", `DELETE FROM hive.x.t WHERE id IN (SELECT o.user_id FROM hive.raw.orders o)`, false},
-		{"update_set_subquery", "trino", `UPDATE hive.x.t SET amount = (SELECT max(o.amount) FROM hive.raw.orders o) WHERE id = 1`, false},
-		{"merge_using_select", "trino", `MERGE INTO hive.x.t USING (SELECT o.user_id, o.amount FROM hive.raw.orders o) s ON t.id = s.user_id WHEN MATCHED THEN UPDATE SET amount = s.amount`, true},
-		{"update_from_select", "postgresql", `UPDATE t SET x = s.v FROM (SELECT o.user_id, o.amount AS v FROM hive.raw.orders o) s WHERE t.id = s.user_id`, true},
+		{"insert_values", "trino", `INSERT INTO hive.x.t VALUES (1, 'a')`, map[string][]string{}},
+		{"create_table_columns", "trino", `CREATE TABLE hive.x.t (id BIGINT, name VARCHAR)`, map[string][]string{}},
+		{"create_table_like", "trino", `CREATE TABLE hive.x.t (LIKE hive.raw.orders)`, map[string][]string{}},
+		{"delete_where_subquery", "trino", `DELETE FROM hive.x.t WHERE id IN (SELECT o.user_id FROM hive.raw.orders o)`, map[string][]string{}},
+		{"update_set_subquery", "trino", `UPDATE hive.x.t SET amount = (SELECT max(o.amount) FROM hive.raw.orders o) WHERE id = 1`, map[string][]string{"hive.raw.orders": {"amount"}, "hive.x.t": {}}},
+		{"merge_using_select", "trino", `MERGE INTO hive.x.t USING (SELECT o.user_id, o.amount FROM hive.raw.orders o) s ON t.id = s.user_id WHEN MATCHED THEN UPDATE SET amount = s.amount`, map[string][]string{"hive.raw.orders": {"amount"}, "hive.x.t": {}}},
+		{"update_from_select", "postgresql", `UPDATE t SET x = s.v FROM (SELECT o.user_id, o.amount AS v FROM hive.raw.orders o) s WHERE t.id = s.user_id`, map[string][]string{"hive.raw.orders": {"amount"}, "t": {}}},
 	}
 
 	for _, tc := range cases {
@@ -253,11 +247,8 @@ func TestInnerQueryUnsupportedShapes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LineageSourceColumns [%s] %q: %v", tc.dialect, tc.sql, err)
 			}
-			if len(got) != 0 {
-				t.Fatalf("%s: LineageSourceColumns = %v; want empty (current behavior)", tc.name, got)
-			}
-			if tc.gap {
-				t.Logf("KNOWN GAP: %s reads hive.raw.orders but lineage is empty today", tc.name)
+			if !reflect.DeepEqual(got, tc.expected) {
+				t.Fatalf("%s: LineageSourceColumns = %v; want %v", tc.name, got, tc.expected)
 			}
 		})
 	}

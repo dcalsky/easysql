@@ -14,7 +14,8 @@ import (
 )
 
 // TableRef identifies a table-like relation. Catalog and Schema are optional;
-// Table is required when the ref is used as a rewrite target.
+// Catalog requires Schema, and Table is required when the ref is used as a
+// rewrite target.
 type TableRef struct {
 	Catalog string
 	Schema  string
@@ -119,7 +120,10 @@ func RewriteTableReferences(sql string, specs []TableRewrite, opts ...RewriteTab
 	}
 
 	cfg := rewriteTablesConfig{dialect: "trino", stripMatchCatalogs: map[string]struct{}{}}
-	for _, opt := range opts {
+	for i, opt := range opts {
+		if opt == nil {
+			return "", fmt.Errorf("easysql: table rewrite option %d must not be nil", i)
+		}
 		opt(&cfg)
 	}
 	if strings.TrimSpace(cfg.dialect) == "" {
@@ -204,6 +208,9 @@ func RewriteTableReferences(sql string, specs []TableRewrite, opts ...RewriteTab
 		return "", fmt.Errorf("%w: generate failed: %v", ErrInternal, err)
 	}
 	out := gen[0]
+	if err := guardInput(out); err != nil {
+		return "", fmt.Errorf("easysql: generated rewritten SQL exceeds safe limits: %w", err)
+	}
 	if _, err := client.ParseOne(out, pg); err != nil {
 		return "", fmt.Errorf("%w: rewritten SQL failed to re-parse: %v\nrewritten: %s",
 			ErrInternal, err, out)
@@ -227,6 +234,10 @@ func compileTableRewritePlan(specs []TableRewrite) (map[string]compiledTableRewr
 		if key == "" {
 			return nil, errors.New("easysql: table rewrite match key must not be empty")
 		}
+		keyParts := strings.Split(key, ".")
+		if len(keyParts) != 2 || strings.TrimSpace(keyParts[0]) == "" || strings.TrimSpace(keyParts[1]) == "" {
+			return nil, fmt.Errorf("easysql: table rewrite match key %q must be schema.table", spec.MatchKey)
+		}
 		if _, exists := plan[key]; exists {
 			return nil, fmt.Errorf("easysql: duplicate table rewrite match key %q", spec.MatchKey)
 		}
@@ -234,8 +245,8 @@ func compileTableRewritePlan(specs []TableRewrite) (map[string]compiledTableRewr
 			return nil, fmt.Errorf("easysql: rewrite %q must have exactly one target", spec.MatchKey)
 		}
 		if spec.Inline != nil {
-			if strings.TrimSpace(spec.Inline.Table) == "" {
-				return nil, fmt.Errorf("easysql: inline rewrite %q requires a target table", spec.MatchKey)
+			if err := validateTableRef(*spec.Inline); err != nil {
+				return nil, fmt.Errorf("easysql: inline rewrite %q: %w", spec.MatchKey, err)
 			}
 			plan[key] = compiledTableRewrite{inline: spec.Inline}
 			continue
@@ -246,17 +257,32 @@ func compileTableRewritePlan(specs []TableRewrite) (map[string]compiledTableRewr
 		if len(spec.Union.Columns) == 0 {
 			return nil, fmt.Errorf("easysql: union rewrite %q requires at least one column", spec.MatchKey)
 		}
+		for i, column := range spec.Union.Columns {
+			if strings.TrimSpace(column) == "" {
+				return nil, fmt.Errorf("easysql: union rewrite %q column %d must not be empty", spec.MatchKey, i)
+			}
+		}
 		if len(spec.Union.Branches) == 0 {
 			return nil, fmt.Errorf("easysql: union rewrite %q requires at least one branch", spec.MatchKey)
 		}
-		for _, branch := range spec.Union.Branches {
-			if strings.TrimSpace(branch.Table) == "" {
-				return nil, fmt.Errorf("easysql: union rewrite %q has a branch without table", spec.MatchKey)
+		for i, branch := range spec.Union.Branches {
+			if err := validateTableRef(branch); err != nil {
+				return nil, fmt.Errorf("easysql: union rewrite %q branch %d: %w", spec.MatchKey, i, err)
 			}
 		}
 		plan[key] = compiledTableRewrite{union: spec.Union}
 	}
 	return plan, nil
+}
+
+func validateTableRef(ref TableRef) error {
+	if strings.TrimSpace(ref.Table) == "" {
+		return errors.New("target table must not be empty")
+	}
+	if strings.TrimSpace(ref.Catalog) != "" && strings.TrimSpace(ref.Schema) == "" {
+		return errors.New("target catalog requires a schema")
+	}
+	return nil
 }
 
 // tableRewriteMatchKey builds the lower-case "schema.table" match key for a
@@ -1293,10 +1319,12 @@ func setTableRef(table map[string]any, ref TableRef) {
 
 var simpleIdentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// needsQuote reports whether an identifier must be quoted to survive parsing.
-// The generator emits the dialect-correct quote characters from the quoted flag.
+// needsQuote reports whether a caller-supplied identifier must be quoted to
+// preserve its exact value. Besides punctuation and whitespace, mixed/upper
+// case needs quoting in folding dialects such as PostgreSQL (Foo otherwise
+// denotes foo). The generator also quotes dialect keywords as needed.
 func needsQuote(name string) bool {
-	return !simpleIdentRe.MatchString(name)
+	return !simpleIdentRe.MatchString(name) || name != strings.ToLower(name)
 }
 
 // newIdent builds an identifier AST node matching the parser's shape.

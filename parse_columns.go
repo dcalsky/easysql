@@ -50,11 +50,10 @@ func parseColumns(client *polyglot.Client, sql string, opts ...LineageOption) ([
 		return nil, errors.New("easysql: nil polyglot client")
 	}
 
-	cfg := lineageOptions{dialect: "trino", producer: lineageProducer, namespace: lineageNamespace}
-	for _, o := range opts {
-		o(&cfg)
+	cfg, err := configuredLineageOptions(opts...)
+	if err != nil {
+		return nil, err
 	}
-	cfg.dialect = normalizeLineageDialect(cfg.dialect)
 
 	stmt, err := parseFirstStatement(client, sql, cfg.dialect)
 	if err != nil {

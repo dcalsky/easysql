@@ -159,7 +159,10 @@ func compile(client *polyglot.Client, whereClause string, opts ...Option) (*rewr
 	}
 
 	cfg := options{dialect: "mysql"}
-	for _, o := range opts {
+	for i, o := range opts {
+		if o == nil {
+			return nil, fmt.Errorf("easysql: row-filter option %d must not be nil", i)
+		}
 		o(&cfg)
 	}
 
@@ -224,6 +227,13 @@ func compile(client *polyglot.Client, whereClause string, opts ...Option) (*rewr
 // compileWhere validates whereClause (it must be a boolean expression) and
 // stores its trimmed text for verbatim splicing.
 func (r *rewriter) compileWhere(whereClause string) error {
+	// The predicate reaches the same native recursive-descent parser as the
+	// statement itself. Guard it independently: a short SELECT can otherwise
+	// smuggle a pathologically deep or oversized predicate past prepare's input
+	// check and crash (or exhaust) the native parser before Go can recover.
+	if err := guardInput(whereClause); err != nil {
+		return fmt.Errorf("easysql: unsafe where clause: %w", err)
+	}
 	raw, err := r.client.ParseOne("SELECT 1 WHERE "+whereClause, r.pg)
 	if err != nil {
 		return fmt.Errorf("easysql: invalid where clause %q: %w", whereClause, err)
@@ -344,6 +354,9 @@ func (r *rewriter) rewrite(sql string) (string, error) {
 		return "", fmt.Errorf("%w: generate failed: %v", ErrInternal, err)
 	}
 	res := gen[0]
+	if err := guardInput(res); err != nil {
+		return "", fmt.Errorf("easysql: generated rewritten SQL exceeds safe limits: %w", err)
+	}
 
 	// Mandatory validity gate: never return SQL that does not parse. This turns
 	// any transform defect into a classified ErrInternal (fail closed) instead

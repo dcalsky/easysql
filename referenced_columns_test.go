@@ -1210,22 +1210,12 @@ func TestBughuntCorrelatedUnqualifiedMetadata(t *testing.T) {
 	got := rcHuntRun(t,
 		`SELECT u.id FROM hive.raw.users u WHERE EXISTS (SELECT 1 FROM hive.raw.orders o WHERE o.uid = u.id AND name = 'x')`,
 		WithLineageMetadata(rcHuntMeta))
-	// Not dropped is the hard requirement; attribution to users is what the
-	// metadata rule implies. Accept either users-only or broadcast including it.
-	all := map[string]bool{}
-	for tbl, cols := range got {
-		for _, c := range cols {
-			if c == "name" {
-				all[tbl] = true
-			}
-		}
-	}
-	if len(all) == 0 {
-		t.Errorf("correlated unqualified column 'name' dropped entirely: %v", got)
-	} else if !all["hive.raw.users"] {
-		// Out of scope (undocumented): metadata attribution across correlation.
-		// Still fail-open (not a drop), so only note it rather than fail.
-		t.Logf("NOTE: 'name' declared only by outer hive.raw.users but attributed to %v (metadata attribution not applied across correlation; still fail-open)", got)
+	want := rcHuntWant(map[string][]string{
+		"hive.raw.users":  {"id", "name"},
+		"hive.raw.orders": {"uid"},
+	})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("correlated unqualified column must resolve through metadata to the outer table:\n got %v\nwant %v", got, want)
 	}
 }
 

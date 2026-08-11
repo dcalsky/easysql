@@ -1,6 +1,9 @@
 package easysql
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	polyglot "github.com/tobilg/polyglot/packages/go"
@@ -18,5 +21,26 @@ func TestBundledFFIVersionMatchesSDK(t *testing.T) {
 	if want := polyglot.Version(); got != want {
 		t.Fatalf("bundled FFI version %q != pinned SDK version %q; "+
 			"update the .ffi artifacts to match go.mod", got, want)
+	}
+}
+
+func TestBundledFFIIntegrityMatchesPinnedDigest(t *testing.T) {
+	path, err := bundledFFIPath()
+	if err != nil {
+		t.Fatalf("bundledFFIPath: %v", err)
+	}
+	if err := verifyBundledFFIIntegrity(path); err != nil {
+		t.Fatalf("verifyBundledFFIIntegrity: %v", err)
+	}
+}
+
+func TestBundledFFIIntegrityRejectsTampering(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ffiLibraryFileName())
+	if err := os.WriteFile(path, []byte("not the bundled native library"), 0o600); err != nil {
+		t.Fatalf("write tampered library: %v", err)
+	}
+	err := verifyBundledFFIIntegrity(path)
+	if err == nil || !strings.Contains(err.Error(), "integrity check failed") {
+		t.Fatalf("tampered native library must fail integrity verification, got %v", err)
 	}
 }

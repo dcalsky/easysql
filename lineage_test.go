@@ -378,6 +378,46 @@ func TestLineageSetOperationValueAndFilterSemantics(t *testing.T) {
 	}
 }
 
+func TestLineageDMLAssignmentValueFlow(t *testing.T) {
+	cases := []struct {
+		name     string
+		dialect  string
+		sql      string
+		expected map[string][]string
+	}{
+		{
+			name:    "update_target_value_excludes_where_filter",
+			dialect: "postgresql",
+			sql:     `UPDATE t SET x = y + 1 WHERE id = 7`,
+			expected: map[string][]string{
+				"t": {"y"},
+			},
+		},
+		{
+			name:    "merge_update_and_insert_values_exclude_match_filters",
+			dialect: "trino",
+			sql: `MERGE INTO t USING r ON t.id = r.id
+				WHEN MATCHED AND r.flag = 1 THEN UPDATE SET x = r.v
+				WHEN NOT MATCHED THEN INSERT (a) VALUES (r.b)`,
+			expected: map[string][]string{
+				"r": {"b", "v"},
+				"t": {},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := LineageSourceColumns(tc.sql, WithLineageDialect(tc.dialect))
+			if err != nil {
+				t.Fatalf("LineageSourceColumns: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.expected) {
+				t.Fatalf("got %v, want %v", got, tc.expected)
+			}
+		})
+	}
+}
+
 // TestLineagePlainSelectMatchesEquivalentCreateView is a focused regression for
 // the requirement that a bare SELECT is analyzed just like its CREATE VIEW
 // wrapper: both must yield the same source columns.

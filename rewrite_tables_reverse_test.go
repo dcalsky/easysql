@@ -482,6 +482,22 @@ func TestRewriteTableReferencesQuotesReservedIdentifiers(t *testing.T) {
 	}
 }
 
+func TestRewriteTableReferencesPreservesMixedCaseTargetIdentifiers(t *testing.T) {
+	out := rewriteTablesValid(t,
+		`SELECT * FROM s.t`,
+		[]TableRewrite{{
+			MatchKey: "s.t",
+			Inline:   &TableRef{Catalog: "TargetCatalog", Schema: "TargetSchema", Table: "TargetTable"},
+		}},
+		WithRewriteDialect("postgres"),
+	)
+
+	const want = `SELECT * FROM (SELECT * FROM "TargetCatalog"."TargetSchema"."TargetTable") AS t`
+	if out != want {
+		t.Fatalf("mixed-case target changed identity:\nwant: %s\n got: %s", want, out)
+	}
+}
+
 func TestRewriteTableReferencesCaseDistinctPostgresTablesGetDistinctAliases(t *testing.T) {
 	spec := TableRewrite{
 		MatchKey: "myschema.mytable",
@@ -493,7 +509,7 @@ func TestRewriteTableReferencesCaseDistinctPostgresTablesGetDistinctAliases(t *t
 		WithRewriteDialect("postgres"),
 	)
 
-	const want = `SELECT myschema_MyTable.a, mytable_2.b FROM (SELECT * FROM vsch.view1) AS myschema_MyTable, (SELECT * FROM vsch.view1) AS mytable_2`
+	const want = `SELECT "myschema_MyTable".a, mytable_2.b FROM (SELECT * FROM vsch.view1) AS "myschema_MyTable", (SELECT * FROM vsch.view1) AS mytable_2`
 	if out != want {
 		t.Fatalf("unexpected rewrite:\nwant: %s\n got: %s", want, out)
 	}
