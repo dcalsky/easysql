@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// testWhere is a verbatim WHERE expression whose single string literal
+// testWhere is a WHERE expression whose single string literal
 // (testMarker) is counted to assert how many tables were wrapped.
 const (
 	testWhere  = "tenant = 'alice'"
@@ -17,7 +17,7 @@ const (
 // --- wrap-count validators (specific to these behavior tests) --------------
 
 // countLiterals counts string literals equal to value in sql's AST. Each wrap
-// splices the WHERE expression once, so when that expression contains exactly
+// applies the WHERE expression once, so when that expression contains exactly
 // one occurrence of value as a string literal this equals the number of wrapped
 // tables.
 func countLiterals(t *testing.T, sql, pg, value string) int {
@@ -209,13 +209,13 @@ func TestDualSkipped(t *testing.T) {
 	rewriteValid(t, "mysql", "select 1 from dual", testWhere, testMarker, 0)
 }
 
-// TestWhereSplicedVerbatim: the WHERE expression is spliced as-is, so a literal
-// the caller already bound appears verbatim in each wrapped table.
-func TestWhereSplicedVerbatim(t *testing.T) {
+// TestWhereExpressionPreserved: a literal the caller already bound appears in
+// each wrapped table after the expression is parsed through the builder plan.
+func TestWhereExpressionPreserved(t *testing.T) {
 	out := rewriteValid(t, "mysql", "select * from a join b on a.id = b.id",
 		"tenant = 'acme'", "acme", 2)
 	if strings.Count(out, "'acme'") != 2 {
-		t.Fatalf("where expression not spliced verbatim into each table: %s", out)
+		t.Fatalf("where expression not applied to each table: %s", out)
 	}
 }
 
@@ -693,14 +693,15 @@ func TestBughuntWhereClauseInjectionRejected(t *testing.T) {
 			t.Fatalf("whereClause %q accepted; expected rejection", w)
 		}
 	}
-	// A line-comment suffix parses in validation ("SELECT 1 WHERE p -- c") but
-	// would comment out the template's closing paren. It must fail (any error
-	// class), never emit malformed or predicate-escaped SQL.
+	// The 0.9 builder parses the predicate as an expression rather than
+	// interpolating it into a larger SQL string, so a trailing line comment is
+	// safely discarded and cannot consume the derived table's closing syntax.
 	out, err := ApplyRowFilter("select * from a", "tenant = 'alice' -- boom", WithDialect("mysql"))
-	if err == nil {
-		if _, perr := testClient.ParseOne(out, "mysql"); perr != nil {
-			t.Fatalf("comment-suffixed whereClause produced unparseable SQL: %s", out)
-		}
+	if err != nil {
+		t.Fatalf("comment-suffixed whereClause rejected: %v", err)
+	}
+	if got := countLiterals(t, out, "mysql", "alice"); got != 1 {
+		t.Fatalf("comment-suffixed whereClause applied %d times, want 1: %s", got, out)
 	}
 }
 

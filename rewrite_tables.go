@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bytedance/sonic"
 	polyglot "github.com/tobilg/polyglot/packages/go"
 )
 
@@ -1125,12 +1124,12 @@ func lookupRebindAlias(parts []string, ctx rebindContext, relations map[string]b
 }
 
 // ---------------------------------------------------------------------------
-// AST-native derived-table construction
+// Builder-plan derived-table construction
 // ---------------------------------------------------------------------------
 
-// Placeholder identifiers used in parse skeletons. They are simple identifiers
-// so the skeleton always parses in any dialect; their leaf values are then
-// substituted with the real (possibly hostile) identifiers.
+// Placeholder identifiers used in builder plans. They are simple identifiers
+// accepted by every dialect; their leaf values are then substituted with the
+// real (possibly hostile) identifiers.
 var (
 	phTableRe = regexp.MustCompile(`^__ez_t(\d+)__$`)
 	phColRe   = regexp.MustCompile(`^__ez_c(\d+)__$`)
@@ -1138,7 +1137,11 @@ var (
 
 // buildInlineSubquery builds the AST for (SELECT * FROM <target>) AS <alias>.
 func buildInlineSubquery(client *polyglot.Client, pg string, target TableRef, alias aliasRef, origTable map[string]any) (map[string]any, error) {
-	sub, err := parseSubqueryWrapper(client, pg, "SELECT * FROM __ez_t0__")
+	plan := polyglot.Select(polyglot.Star()).
+		From(polyglot.Table("__ez_t0__")).
+		Subquery("__ez_alias__").
+		ReadDialect(pg)
+	sub, err := buildSubquery(client, plan, "build inline derived table")
 	if err != nil {
 		return nil, err
 	}
@@ -1153,22 +1156,26 @@ func buildInlineSubquery(client *polyglot.Client, pg string, target TableRef, al
 // buildUnionSubquery builds the AST for
 // (SELECT <cols> FROM <branch0> UNION DISTINCT SELECT <cols> FROM <branch1> ...) AS <alias>.
 func buildUnionSubquery(client *polyglot.Client, pg string, spec UnionRewrite, alias aliasRef, origTable map[string]any) (map[string]any, error) {
-	colPlaceholders := make([]string, len(spec.Columns))
+	colPlaceholders := make([]any, len(spec.Columns))
 	for j := range spec.Columns {
-		colPlaceholders[j] = fmt.Sprintf("__ez_c%d__", j)
+		colPlaceholders[j] = polyglot.Column(fmt.Sprintf("__ez_c%d__", j))
 	}
-	colList := strings.Join(colPlaceholders, ", ")
-
-	branches := make([]string, len(spec.Branches))
-	for k := range spec.Branches {
-		branches[k] = fmt.Sprintf("SELECT %s FROM __ez_t%d__", colList, k)
+	query := polyglot.Select(colPlaceholders...).
+		From(polyglot.Table("__ez_t0__"))
+	for k := 1; k < len(spec.Branches); k++ {
+		branch := polyglot.Select(colPlaceholders...).
+			From(polyglot.Table(fmt.Sprintf("__ez_t%d__", k)))
+		query = query.Union(branch, true)
 	}
-	inner := strings.Join(branches, " UNION DISTINCT ")
-
-	sub, err := parseSubqueryWrapper(client, pg, inner)
+	plan := query.Subquery("__ez_alias__").ReadDialect(pg)
+	sub, err := buildSubquery(client, plan, "build UNION derived table")
 	if err != nil {
 		return nil, err
 	}
+	// The builder's distinct=true variant is semantically UNION DISTINCT but
+	// intentionally renders the optional DISTINCT keyword canonically as UNION.
+	// Preserve this API's established explicit spelling in regenerated SQL.
+	markUnionDistinct(sub["this"])
 	if err := substitutePlaceholders(sub, spec.Branches, spec.Columns); err != nil {
 		return nil, err
 	}
@@ -1221,35 +1228,25 @@ func replaceTableWithSubquery(entry, sub map[string]any) {
 	}
 }
 
-// parseSubqueryWrapper parses "SELECT * FROM (<innerSQL>) AS <ph>" and returns
-// the derived-table (subquery) node, which carries every field the generator
-// requires.
-func parseSubqueryWrapper(client *polyglot.Client, pg, innerSQL string) (map[string]any, error) {
-	raw, err := client.ParseOne("SELECT * FROM ("+innerSQL+") AS __ez_alias__", pg)
-	if err != nil {
-		return nil, fmt.Errorf("%w: build derived table: %v", ErrInternal, err)
+// markUnionDistinct preserves the public output's explicit UNION DISTINCT
+// spelling. Polyglot's builder represents the same semantics with all=false and
+// leaves the optional keyword implicit, whereas parsed UNION DISTINCT nodes set
+// the distinct marker used by the generator.
+func markUnionDistinct(node any) {
+	switch value := node.(type) {
+	case map[string]any:
+		if union, ok := value["union"].(map[string]any); ok {
+			union["all"] = false
+			union["distinct"] = true
+		}
+		for _, child := range value {
+			markUnionDistinct(child)
+		}
+	case []any:
+		for _, child := range value {
+			markUnionDistinct(child)
+		}
 	}
-	var stmt map[string]any
-	if err := sonic.Unmarshal(raw, &stmt); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
-	}
-	exprs, ok := dig(stmt, "select", "from", "expressions")
-	if !ok {
-		return nil, fmt.Errorf("%w: malformed derived table template", ErrInternal)
-	}
-	list, ok := exprs.([]any)
-	if !ok || len(list) == 0 {
-		return nil, fmt.Errorf("%w: malformed derived table template", ErrInternal)
-	}
-	entry, ok := list[0].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("%w: malformed derived table template", ErrInternal)
-	}
-	sub, ok := entry["subquery"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("%w: malformed derived table template", ErrInternal)
-	}
-	return sub, nil
 }
 
 // substitutePlaceholders walks a parsed skeleton, replacing placeholder table

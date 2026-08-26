@@ -20,8 +20,8 @@ types return `ErrUnsupported`.
 
 Output is normalized by the SQL generator. Comments are dropped; identifiers
 and literals are retained. If no table is in scope, the input is returned
-unchanged. The predicate is inserted into the AST as supplied, so callers must
-bind and escape values before calling it.
+unchanged. The predicate is parsed as a dialect-aware builder expression and
+inserted into the AST, so callers must bind and escape values before calling it.
 
 | Option | Meaning |
 | --- | --- |

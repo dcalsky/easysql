@@ -72,8 +72,8 @@ type rewriter struct {
 	regexps      []*regexp.Regexp
 	defaultDB    string
 
-	// whereText is the caller's predicate, baked verbatim into the subquery
-	// template's WHERE clause.
+	// whereText is the caller's predicate, parsed into the subquery template's
+	// WHERE clause by Polyglot's builder engine.
 	whereText string
 
 	normalize func(string) string // optional dialect text normalizer
@@ -128,10 +128,10 @@ func WithSelfCheck(bool) Option { return func(*options) {} }
 //
 //	select * from a  ->  SELECT * FROM (SELECT * FROM a WHERE <whereClause>) AS a
 //
-// whereClause is a boolean SQL expression spliced verbatim, so the caller is
-// responsible for any value binding or escaping inside it. The statement is
-// rebuilt from its AST, so the output is normalized (re-formatted) rather than
-// byte-identical to the input.
+// whereClause is parsed as a boolean SQL expression in the selected dialect, so
+// the caller remains responsible for binding or escaping values inside it. The
+// statement is rebuilt from its AST, so the output is normalized (re-formatted)
+// rather than byte-identical to the input.
 //
 // The native SQL engine is loaded automatically on first use (see Init), so no
 // setup is required. Errors classify via errors.Is against ErrParse,
@@ -225,7 +225,7 @@ func compile(client *polyglot.Client, whereClause string, opts ...Option) (*rewr
 }
 
 // compileWhere validates whereClause (it must be a boolean expression) and
-// stores its trimmed text for verbatim splicing.
+// stores its trimmed text for the immutable builder plan.
 func (r *rewriter) compileWhere(whereClause string) error {
 	// The predicate reaches the same native recursive-descent parser as the
 	// statement itself. Guard it independently: a short SELECT can otherwise
@@ -247,10 +247,8 @@ func (r *rewriter) compileWhere(whereClause string) error {
 		return fmt.Errorf("easysql: invalid where clause %q: not a boolean expression", whereClause)
 	}
 	r.whereText = strings.TrimSpace(whereClause)
-	// Build the subquery template now so a predicate that validates on its own
-	// but cannot be safely spliced into the filter subquery (e.g. one ending in
-	// a line comment that would swallow the template's closing paren) is
-	// reported here as a plain configuration error, rather than later as an
+	// Evaluate the subquery plan now so any builder-level incompatibility is
+	// reported as a plain configuration error rather than later as an
 	// ErrInternal from the rewrite.
 	if _, err := r.subqueryTemplate(); err != nil {
 		return fmt.Errorf("easysql: where clause %q cannot be safely applied as a filter predicate", whereClause)
@@ -373,38 +371,21 @@ func (r *rewriter) rewrite(sql string) (string, error) {
 //
 //	(SELECT * FROM __ph__ WHERE <predicate>) AS __ph__
 //
-// Building it by parsing once (rather than hand-assembling JSON) guarantees the
-// node carries every field the engine expects. The inner FROM table and the
-// subquery alias are substituted per call in wrapTableNode.
+// Polyglot's immutable builder plan constructs the node in the shared Rust AST
+// engine. The inner FROM table and subquery alias are substituted per call in
+// wrapTableNode.
 func (r *rewriter) subqueryTemplate() (map[string]any, error) {
 	if r.tmplSubquery != nil {
 		return r.tmplSubquery, nil
 	}
-	tmplSQL := "SELECT * FROM (SELECT * FROM " + tmplPlaceholder + " WHERE " +
-		r.whereText + ") AS " + tmplPlaceholder
-	raw, err := r.client.ParseOne(tmplSQL, r.pg)
+	plan := polyglot.Select(polyglot.Star()).
+		From(polyglot.Table(tmplPlaceholder)).
+		Where(polyglot.Condition(r.whereText)).
+		Subquery(tmplPlaceholder).
+		ReadDialect(r.pg)
+	sub, err := buildSubquery(r.client, plan, "build row-filter subquery template")
 	if err != nil {
-		return nil, fmt.Errorf("%w: building subquery template: %v", ErrInternal, err)
-	}
-	var node map[string]any
-	if err := sonic.Unmarshal(raw, &node); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
-	}
-	exprs, ok := dig(node, "select", "from", "expressions")
-	if !ok {
-		return nil, fmt.Errorf("%w: malformed subquery template", ErrInternal)
-	}
-	list, ok := exprs.([]any)
-	if !ok || len(list) == 0 {
-		return nil, fmt.Errorf("%w: malformed subquery template", ErrInternal)
-	}
-	item, ok := list[0].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("%w: malformed subquery template", ErrInternal)
-	}
-	sub, ok := item["subquery"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("%w: malformed subquery template", ErrInternal)
+		return nil, err
 	}
 	r.tmplSubquery = sub
 	return sub, nil

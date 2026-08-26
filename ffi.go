@@ -50,9 +50,9 @@ const integrityCheckSkipEnv = "EASYSQL_SKIP_FFI_INTEGRITY_CHECK"
 // check cannot protect against a malicious library because its initialization
 // code has already executed by then.
 var bundledFFISHA256 = map[string]string{
-	"polyglot-sql-ffi-macos-aarch64":  "aedf843b09640b933926e5688ad68c5831a69511c983bfab8e4a49b07ab5a299",
-	"polyglot-sql-ffi-linux-x86_64":   "1b663343cb0b104391ed922911475d17f918ab2023b4cc8dca524e94933a1fbb",
-	"polyglot-sql-ffi-windows-x86_64": "a0f90b8569c242a3c17b8efe127d2d41e2cd580c3e1b7c9edb65237ee0f7f180",
+	"polyglot-sql-ffi-macos-aarch64":  "175a83c0cb8be125cece09ca3a8bc40c982b9dfc2870ce97c0fdfd7b643adacb",
+	"polyglot-sql-ffi-linux-x86_64":   "357f00115ccd3b276a8395e7072a1909b7a73f70c6ea6e636979932c7ec2c1ef",
+	"polyglot-sql-ffi-windows-x86_64": "dae7e6bbc0f6afb390ff91472107b47999a5c508b94ac1963250f73961008ee9",
 }
 
 // The process-wide SQL engine. It is opened lazily, exactly once, the first time

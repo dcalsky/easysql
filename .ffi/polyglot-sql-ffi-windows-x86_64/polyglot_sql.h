@@ -124,6 +124,11 @@ polyglot_result_t polyglot_rename_tables_with_options(const char *ast_json,
                                                       const char *options_json);
 
 /**
+ * Evaluate a versioned, stateless SQL builder request.
+ */
+polyglot_result_t polyglot_build(const char *request_json);
+
+/**
  * Return supported dialect names as JSON.
  */
 char *polyglot_dialect_list(void);
