@@ -17,6 +17,22 @@ on:
         default: ""
 
 jobs:
+  test:
+    name: Go tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Run tests with race detector
+        shell: bash
+        run: go test -race ./...
+
   verify:
     name: go get (${{ matrix.os }})
     strategy:
@@ -36,3 +52,25 @@ jobs:
           EASYSQL_VERIFY_VERSION: ${{ github.event.inputs.version }}
           EASYSQL_VERIFY_REPLACE: ${{ github.event.inputs.version == '' && github.workspace || '' }}
         run: bash scripts/verify-goget.sh
+
+  native:
+    name: Native C ABI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build library and run C consumer
+        shell: bash
+        run: bash scripts/test-native.sh
+      - name: Upload native package
+        uses: actions/upload-artifact@v6
+        with:
+          name: easysql-native-${{ runner.os }}-${{ runner.arch }}
+          path: dist/native/
+          if-no-files-found: error

@@ -20,5 +20,17 @@ For an unpublished checkout:
 EASYSQL_VERIFY_REPLACE="$PWD" scripts/verify-goget.sh
 ```
 
-The CI workflow runs the consumer smoke test on Linux, macOS, and Windows:
+Build the native C ABI package and run a compiled C consumer against it:
+
+```bash
+bash scripts/test-native.sh
+```
+
+The test builds the shared library, verifies that it finds the sibling Polyglot
+runtime independently of the working directory, verifies that a missing sibling
+fails closed, exercises success and error responses, and repeatedly checks
+allocation/free ownership.
+
+The CI workflow runs Go tests, the `go get` consumer smoke test, and the native
+C ABI build/consumer test on Linux, macOS, and Windows:
 [`goget-verify.yml`](../.github/workflows/goget-verify.yml).
