@@ -115,5 +115,5 @@ uses, err := easysql.ReferencedColumnUsages(
 
 - [API reference](docs/api.md)
 - [Native runtime](docs/native-runtime.md)
-- [Native C ABI](docs/native-library.md)
+- [Native SDK (Python, JavaScript, Go)](docs/native-library.md)
 - [Development](docs/development.md)

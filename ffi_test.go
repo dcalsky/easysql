@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	polyglot "github.com/tobilg/polyglot/packages/go"
@@ -34,8 +35,41 @@ func TestBundledFFIIntegrityMatchesPinnedDigest(t *testing.T) {
 	}
 }
 
+func TestBundledFFIPathMaterializesConcurrently(t *testing.T) {
+	t.Setenv(engineCacheDirEnv, t.TempDir())
+	const workers = 8
+	paths := make(chan string, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			path, err := bundledFFIPath()
+			paths <- path
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(paths)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("bundledFFIPath: %v", err)
+		}
+	}
+	for path := range paths {
+		if strings.Contains(strings.ToLower(filepath.Base(path)), "polyglot") {
+			t.Fatalf("private runtime name leaked implementation detail: %q", path)
+		}
+		if err := verifyBundledFFIIntegrity(path); err != nil {
+			t.Fatalf("materialized runtime %q: %v", path, err)
+		}
+	}
+}
+
 func TestBundledFFIIntegrityRejectsTampering(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ffiLibraryFileName())
+	path := filepath.Join(t.TempDir(), bundledRuntimeFileName)
 	if err := os.WriteFile(path, []byte("not the bundled native library"), 0o600); err != nil {
 		t.Fatalf("write tampered library: %v", err)
 	}
@@ -77,7 +111,7 @@ func TestOpenClientRejectsNonRegularRuntime(t *testing.T) {
 	if err := os.WriteFile(target, []byte("not a library"), 0o600); err != nil {
 		t.Fatalf("write target: %v", err)
 	}
-	link := filepath.Join(dir, ffiLibraryFileName())
+	link := filepath.Join(dir, bundledRuntimeFileName)
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}

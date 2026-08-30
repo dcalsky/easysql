@@ -5,13 +5,13 @@ include PostgreSQL, Trino/Presto, StarRocks, and MySQL.
 
 ## Runtime initialization
 
-`Init` eagerly locates and verifies the Polyglot runtime bundled with the Go
+`Init` eagerly authenticates and loads the native SQL engine embedded in the Go
 module. Calling it is optional because SQL APIs initialize that runtime lazily.
 
-`InitWithRuntimePath` is for native-library embeddings that distribute the
-trusted Polyglot library at an explicit location. It applies the same regular
-file, SHA-256, and SDK-version checks. Initialization is process-wide and
-first-call-wins, so an explicit path must be selected before any SQL API call.
+`InitWithRuntimePath` is for controlled deployments that select a trusted engine
+at an explicit location. It applies the same regular-file, SHA-256, and version
+checks. Initialization is process-wide and first-call-wins, so an explicit path
+must be selected before any SQL API call.
 
 ## ApplyRowFilter
 
