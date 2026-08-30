@@ -81,12 +81,15 @@ to `PATH`.
 
 ## ABI
 
-The library exports four functions:
+The library exports six functions:
 
 ```c
 uint32_t easysql_abi_version(void);
 char *easysql_version(void);
+size_t easysql_version_into(void *output, size_t capacity);
 char *easysql_execute(const void *request_json, size_t request_len);
+size_t easysql_execute_into(const void *request_json, size_t request_len,
+                            void *output, size_t capacity);
 void easysql_free_string(char *value);
 ```
 
@@ -94,6 +97,10 @@ Strings returned by `easysql_version` and `easysql_execute` are allocated by
 the library and must be released exactly once with `easysql_free_string`.
 Requests do not need a trailing NUL. All functions are safe for concurrent
 callers; no Go pointer is retained across the C boundary.
+
+The `_into` variants avoid cross-runtime allocation ownership. Pass `NULL/0`
+to obtain the required capacity including the trailing NUL, allocate a buffer,
+then call again to copy the value. The JavaScript binding uses these variants.
 
 Every request has this envelope:
 

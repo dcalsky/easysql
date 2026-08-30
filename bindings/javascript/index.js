@@ -22,9 +22,8 @@ class EasySQL {
   constructor(libraryPath = defaultLibraryPath()) {
     this.library = koffi.load(libraryPath);
     this._abiVersion = this.library.func('uint32_t easysql_abi_version()');
-    this._version = this.library.func('void *easysql_version()');
-    this._execute = this.library.func('void *easysql_execute(const void *data, size_t length)');
-    this._free = this.library.func('void easysql_free_string(void *value)');
+    this._versionInto = this.library.func('size_t easysql_version_into(void *output, size_t capacity)');
+    this._executeInto = this.library.func('size_t easysql_execute_into(const void *data, size_t length, void *output, size_t capacity)');
 
     const actual = this._abiVersion();
     if (actual !== ABI_VERSION) {
@@ -32,24 +31,29 @@ class EasySQL {
     }
   }
 
-  _consume(pointer) {
-    if (!pointer) throw new Error('easysql returned a null response');
-    try {
-      return koffi.decode.string(pointer);
-    } finally {
-      this._free(pointer);
-    }
-  }
-
   version() {
-    return this._consume(this._version());
+    return this._readInto((output, capacity) => this._versionInto(output, capacity));
   }
 
   execute(request) {
     const text = Buffer.isBuffer(request)
       ? request
       : Buffer.from(typeof request === 'string' ? request : JSON.stringify(request), 'utf8');
-    return JSON.parse(this._consume(this._execute(text, text.length)));
+    return JSON.parse(this._readInto((output, capacity) =>
+      this._executeInto(text, text.length, output, capacity)));
+  }
+
+  _readInto(write) {
+    const required = Number(write(null, 0));
+    if (!Number.isSafeInteger(required) || required < 1) {
+      throw new Error(`easysql returned an invalid buffer size: ${required}`);
+    }
+    const output = Buffer.alloc(required);
+    const actual = Number(write(output, output.length));
+    if (actual !== required) {
+      throw new Error(`easysql response size changed from ${required} to ${actual}`);
+    }
+    return output.subarray(0, required - 1).toString('utf8');
   }
 }
 

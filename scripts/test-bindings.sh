@@ -48,13 +48,13 @@ PYTHONPATH="${package_dir}/bindings/python" \
 python3 -c 'import json, os, easysql; response = easysql.execute(json.loads(os.environ["EASYSQL_TEST_REQUEST"])); assert response["status"] == 0 and "tenant_id = 7" in response["data"]'
 
 mkdir -p "${test_dir}/javascript"
-npm install --prefix "${test_dir}/javascript" --no-package-lock --no-save --silent 'koffi@^3.1.0'
+npm install --prefix "${test_dir}/javascript" --no-package-lock --no-save --silent 'koffi@3.1.6'
 EASYSQL_LIBRARY_PATH="${library_path}" \
 EASYSQL_ENGINE_CACHE_DIR="${test_dir}/engine-cache" \
 EASYSQL_TEST_REQUEST="${request}" \
 EASYSQL_JS_BINDING="${package_dir}/bindings/javascript" \
 NODE_PATH="${test_dir}/javascript/node_modules" \
-node -e 'const api = require(process.env.EASYSQL_JS_BINDING); const response = api.execute(JSON.parse(process.env.EASYSQL_TEST_REQUEST)); if (response.status !== 0 || !response.data.includes("tenant_id = 7")) process.exit(1)'
+node -e 'const api = require(process.env.EASYSQL_JS_BINDING); if (!api.version()) process.exit(1); for (let i = 0; i < 100; i++) { const response = api.execute(JSON.parse(process.env.EASYSQL_TEST_REQUEST)); if (response.status !== 0 || !response.data.includes("tenant_id = 7")) process.exit(1); }'
 
 if [[ "${target_os}" == "windows" ]]; then
   (cd "${package_dir}/bindings/go" && EASYSQL_ENGINE_CACHE_DIR="${test_dir}/engine-cache" PATH="${package_dir}/lib:${PATH}" go test ./...)

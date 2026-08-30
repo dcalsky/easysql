@@ -33,6 +33,12 @@ EASYSQL_API uint32_t easysql_abi_version(void);
 EASYSQL_API char *easysql_version(void);
 
 /*
+ * Copy the library version into caller-owned memory and return the required
+ * capacity including the trailing NUL. Pass NULL/0 to query the size.
+ */
+EASYSQL_API size_t easysql_version_into(void *output, size_t capacity);
+
+/*
  * Execute a versioned JSON request and return a newly allocated JSON response.
  * request_json does not need to be NUL terminated. The caller retains ownership
  * of the request buffer and must release the response with easysql_free_string.
@@ -41,6 +47,19 @@ EASYSQL_API char *easysql_version(void);
  * data; on failure it contains error. This function is thread-safe.
  */
 EASYSQL_API char *easysql_execute(const void *request_json, size_t request_len);
+
+/*
+ * Execute a request and copy the UTF-8 JSON response into caller-owned memory.
+ * The return value is the required capacity including the trailing NUL. Pass a
+ * NULL output or zero capacity to query the size; the request is executed again
+ * when called with the allocated buffer.
+ */
+EASYSQL_API size_t easysql_execute_into(
+    const void *request_json,
+    size_t request_len,
+    void *output,
+    size_t capacity
+);
 
 /* Release a string returned by this library. NULL is accepted. */
 EASYSQL_API void easysql_free_string(char *value);
