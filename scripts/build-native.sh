@@ -8,21 +8,15 @@ target_arch="$(go env GOARCH)"
 case "${target_os}/${target_arch}" in
   darwin/arm64)
     platform="macos-aarch64"
-    polyglot_platform="polyglot-sql-ffi-macos-aarch64"
     easysql_library="libeasysql.dylib"
-    polyglot_library="libpolyglot_sql_ffi.dylib"
     ;;
   linux/amd64)
     platform="linux-x86_64"
-    polyglot_platform="polyglot-sql-ffi-linux-x86_64"
     easysql_library="libeasysql.so"
-    polyglot_library="libpolyglot_sql_ffi.so"
     ;;
   windows/amd64)
     platform="windows-x86_64"
-    polyglot_platform="polyglot-sql-ffi-windows-x86_64"
     easysql_library="easysql.dll"
-    polyglot_library="polyglot_sql_ffi.dll"
     ;;
   *)
     echo "unsupported native target: ${target_os}/${target_arch}" >&2
@@ -34,16 +28,21 @@ package_dir="${EASYSQL_NATIVE_OUTPUT:-${repo_root}/dist/native/${platform}}"
 lib_dir="${package_dir}/lib"
 include_dir="${package_dir}/include"
 license_dir="${package_dir}/licenses"
-runtime_source="${repo_root}/.ffi/${polyglot_platform}/${polyglot_library}"
+bindings_dir="${package_dir}/bindings"
 
-if [[ ! -f "${runtime_source}" ]]; then
-  echo "missing Polyglot runtime: ${runtime_source}" >&2
-  exit 1
-fi
-
-mkdir -p "${lib_dir}" "${include_dir}" "${license_dir}"
+mkdir -p "${lib_dir}" "${include_dir}" "${license_dir}" "${bindings_dir}"
 cp -f "${repo_root}/native/include/easysql.h" "${include_dir}/easysql.h"
-cp -f "${runtime_source}" "${lib_dir}/${polyglot_library}"
+rm -rf "${bindings_dir}/python" "${bindings_dir}/javascript" "${bindings_dir}/go"
+cp -R "${repo_root}/bindings/python" "${bindings_dir}/python"
+cp -R "${repo_root}/bindings/javascript" "${bindings_dir}/javascript"
+cp -R "${repo_root}/bindings/go" "${bindings_dir}/go"
+
+# Remove obsolete sidecar names from an output directory produced by an older
+# build. The engine is embedded in the easysql library now.
+rm -f \
+  "${lib_dir}/libpolyglot_sql_ffi.dylib" \
+  "${lib_dir}/libpolyglot_sql_ffi.so" \
+  "${lib_dir}/polyglot_sql_ffi.dll"
 
 native_version="${EASYSQL_NATIVE_VERSION:-}"
 if [[ -z "${native_version}" ]]; then

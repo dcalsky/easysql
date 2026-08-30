@@ -21,7 +21,7 @@ static char *execute(const char *request) {
     return response;
 }
 
-int main(int argc, char **argv) {
+int main(void) {
     if (easysql_abi_version() != EASYSQL_ABI_VERSION) {
         fail("unexpected ABI version", NULL);
     }
@@ -36,17 +36,6 @@ int main(int argc, char **argv) {
         "{\"abiVersion\":1,\"operation\":\"applyRowFilter\",\"args\":{"
         "\"sql\":\"SELECT id FROM orders\","
         "\"whereClause\":\"tenant_id = 7\",\"dialect\":\"postgres\"}}";
-
-    if (argc == 2 && strcmp(argv[1], "--expect-runtime-error") == 0) {
-        char *response = execute(rewrite_request);
-        if (strstr(response, "\"status\":4") == NULL ||
-            strstr(response, "native runtime") == NULL) {
-            fail("missing sibling runtime did not fail closed", response);
-        }
-        easysql_free_string(response);
-        puts("missing native runtime failed closed");
-        return 0;
-    }
 
     for (int i = 0; i < 1000; i++) {
         char *response = execute(rewrite_request);

@@ -1,7 +1,7 @@
 name: go-get-verify
 
 # Proves easysql is usable with nothing but `go get`: on each supported OS the
-# bundled per-platform native engine must ship with the module and load on first
+# embedded per-platform native engine must ship with the module and load on first
 # use. Pushes/PRs test the checked-out code via a local replace; a manual run can
 # verify an already-published version.
 
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: Build library and run C consumer
+      - name: Build library and run C/Python/JavaScript/Go consumers
         shell: bash
         run: bash scripts/test-native.sh
       - name: Upload native package

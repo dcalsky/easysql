@@ -1,28 +1,22 @@
 # Native runtime
 
-easysql uses the [Polyglot SQL](https://github.com/tobilg/polyglot) shared
-library through PureGo; it does not use cgo. `Init` loads the bundled library
-for the current platform. Every public API initializes the same runtime lazily
-when `Init` was not called first.
+easysql embeds its platform-specific SQL engine. `Init` authenticates and loads
+the embedded engine eagerly; every public API initializes the same process-wide
+runtime lazily when `Init` was not called first.
 
-| GOOS / GOARCH | Library |
-| --- | --- |
-| `darwin` / `arm64` | `.ffi/polyglot-sql-ffi-macos-aarch64/libpolyglot_sql_ffi.dylib` |
-| `linux` / `amd64` | `.ffi/polyglot-sql-ffi-linux-x86_64/libpolyglot_sql_ffi.so` |
-| `windows` / `amd64` | `.ffi/polyglot-sql-ffi-windows-x86_64/polyglot_sql_ffi.dll` |
+Supported targets are macOS ARM64, Linux x86-64, and Windows x86-64. Unsupported
+platforms and runtime-version mismatches fail initialization.
 
-The loaded library version is checked against the pinned Polyglot Go SDK.
-Unsupported platforms and version mismatches fail initialization.
-
-Before the library is loaded, its SHA-256 digest is checked against the artifact
-pinned by this module version. This prevents a same-named `.ffi` file found via
-the runtime search path from executing before the SDK version check runs.
+Before native code is loaded, its SHA-256 digest is checked against the artifact
+pinned by this module version. The authenticated bytes are materialized into a
+content-addressed user-private cache, so Go programs and native-library consumers
+do not need a runtime sidecar or working-directory setup.
 
 `EASYSQL_SKIP_FFI_VERSION_CHECK=1` bypasses that check and is unsupported.
 `EASYSQL_SKIP_FFI_INTEGRITY_CHECK=1` separately bypasses the pre-load digest
 check for deliberate custom builds and is also unsupported.
 
-Native-library embeddings use `InitWithRuntimePath` to select the trusted
-Polyglot artifact distributed next to `libeasysql`. The explicit path is still
-subject to the regular-file, SHA-256, and SDK-version checks above, and must be
-selected before any SQL API initializes the process-wide client.
+Controlled deployments may use `InitWithRuntimePath` to select an explicit
+trusted engine artifact. The path is still subject to regular-file, SHA-256,
+and version checks, and must be selected before any SQL API initializes the
+process-wide client.

@@ -20,16 +20,16 @@ For an unpublished checkout:
 EASYSQL_VERIFY_REPLACE="$PWD" scripts/verify-goget.sh
 ```
 
-Build the native C ABI package and run a compiled C consumer against it:
+Build the native SDK and run C, Python, JavaScript, and Go consumers against it:
 
 ```bash
 bash scripts/test-native.sh
 ```
 
-The test builds the shared library, verifies that it finds the sibling Polyglot
-runtime independently of the working directory, verifies that a missing sibling
-fails closed, exercises success and error responses, and repeatedly checks
-allocation/free ownership.
+The test builds the single shared library with its embedded engine, exercises
+success and error responses, repeatedly checks allocation/free ownership, and
+runs all three supported language bindings. It also rejects internal engine
+names in the public library, header, and binding layout.
 
 The CI workflow runs Go tests, the `go get` consumer smoke test, and the native
 C ABI build/consumer test on Linux, macOS, and Windows:

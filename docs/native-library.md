@@ -18,15 +18,17 @@ bash scripts/test-native.sh
 include/easysql.h
 lib/libeasysql.{so,dylib}       # easysql.dll on Windows
 lib/libeasysql.dll.a             # Windows import library only
-lib/libpolyglot_sql_ffi.*
+bindings/python/
+bindings/javascript/
+bindings/go/
 licenses/
 ```
 
-The two libraries must remain in the same directory. `libeasysql` locates its
-own loaded module at runtime and opens the matching Polyglot library beside it;
-it does not depend on the host process's working directory. The Polyglot file
-is authenticated before loading and its runtime version must match the pinned
-Go SDK.
+The platform-specific SQL engine is embedded in `libeasysql`; there is no
+runtime sidecar to install or place on a library search path. On first use the
+library authenticates the embedded bytes, writes them to a content-addressed
+private cache, and loads that cache entry. The public package layout and API
+only expose easysql names. Third-party notices remain under `licenses/`.
 
 Supported release targets are currently:
 
@@ -39,6 +41,43 @@ Supported release targets are currently:
 Set `EASYSQL_NATIVE_OUTPUT` to change the output directory and
 `EASYSQL_NATIVE_VERSION` to set the version returned by `easysql_version`.
 Release builds normally set the latter to the release tag.
+
+## Language bindings
+
+The Python binding uses only the standard library:
+
+```python
+import easysql
+
+response = easysql.execute({
+    "abiVersion": 1,
+    "operation": "parseColumns",
+    "args": {"sql": "SELECT id FROM orders"},
+})
+```
+
+Add `bindings/python` to `PYTHONPATH`, or copy its `easysql` package into the
+application. It locates the sibling `lib/` directory automatically;
+`EASYSQL_LIBRARY_PATH` can select an explicit library.
+
+The JavaScript binding supports Node.js 16 or newer and uses
+[`koffi`](https://koffi.dev/):
+
+```javascript
+const easysql = require('./bindings/javascript');
+const response = easysql.execute({
+  abiVersion: 1,
+  operation: 'parseColumns',
+  args: {sql: 'SELECT id FROM orders'},
+});
+```
+
+Run `npm install` in `bindings/javascript` before first use. The Go binding is
+a small cgo module under `bindings/go`; applications can reference it with a
+local `replace` directive and call `Execute` or `ExecuteJSON`. Its linker flags
+locate the library shipped in the same extracted SDK. On Windows, keep
+`easysql.dll` beside the application executable or add the SDK's `lib` directory
+to `PATH`.
 
 ## ABI
 

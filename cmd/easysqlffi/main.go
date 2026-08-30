@@ -8,8 +8,6 @@ import "C"
 
 import (
 	"fmt"
-	"path/filepath"
-	"runtime"
 	"sync"
 	"unsafe"
 
@@ -64,25 +62,9 @@ func easysql_free_string(value *C.char) {
 
 func initializeRuntime() error {
 	runtimeOnce.Do(func() {
-		dir, err := moduleDirectory()
-		if err != nil {
-			runtimeErr = err
-			return
-		}
-		runtimeErr = easysql.InitWithRuntimePath(filepath.Join(dir, polyglotLibraryFileName()))
+		runtimeErr = easysql.Init()
 	})
 	return runtimeErr
-}
-
-func polyglotLibraryFileName() string {
-	switch runtime.GOOS {
-	case "darwin":
-		return "libpolyglot_sql_ffi.dylib"
-	case "windows":
-		return "polyglot_sql_ffi.dll"
-	default:
-		return "libpolyglot_sql_ffi.so"
-	}
 }
 
 func main() {}
