@@ -4,6 +4,7 @@ const path = require('node:path');
 const koffi = require('koffi');
 
 const ABI_VERSION = 1;
+const pinnedLibraries = [];
 
 function libraryName() {
   switch (process.platform) {
@@ -18,9 +19,24 @@ function defaultLibraryPath() {
   return process.env.EASYSQL_LIBRARY_PATH || path.resolve(__dirname, '..', '..', 'lib', libraryName());
 }
 
+function loadLibrary(libraryPath) {
+  const resolved = path.resolve(libraryPath);
+  if (process.platform === 'win32') {
+    // Go c-shared DLLs are process runtimes and must not be unloaded before
+    // process termination. Koffi automatically unloads unreferenced libraries,
+    // so retain an independent Windows loader reference for the process lifetime.
+    const kernel32 = koffi.load('kernel32.dll');
+    const loadLibraryW = kernel32.func('void *LoadLibraryW(str16 filename)');
+    const handle = loadLibraryW(resolved);
+    if (!handle) throw new Error(`failed to pin easysql library: ${resolved}`);
+    pinnedLibraries.push({kernel32, handle});
+  }
+  return koffi.load(resolved);
+}
+
 class EasySQL {
   constructor(libraryPath = defaultLibraryPath()) {
-    this.library = koffi.load(libraryPath);
+    this.library = loadLibrary(libraryPath);
     this._abiVersion = this.library.func('uint32_t easysql_abi_version()');
     this._versionInto = this.library.func('size_t easysql_version_into(void *output, size_t capacity)');
     this._executeInto = this.library.func('size_t easysql_execute_into(const void *data, size_t length, void *output, size_t capacity)');
