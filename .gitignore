@@ -8,6 +8,7 @@
 # Go build/test artifacts
 *.test
 *.out
+/dist/
 
 # Python leftovers (the old python/ port is gone)
 .venv/

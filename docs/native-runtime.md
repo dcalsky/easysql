@@ -21,3 +21,8 @@ the runtime search path from executing before the SDK version check runs.
 `EASYSQL_SKIP_FFI_VERSION_CHECK=1` bypasses that check and is unsupported.
 `EASYSQL_SKIP_FFI_INTEGRITY_CHECK=1` separately bypasses the pre-load digest
 check for deliberate custom builds and is also unsupported.
+
+Native-library embeddings use `InitWithRuntimePath` to select the trusted
+Polyglot artifact distributed next to `libeasysql`. The explicit path is still
+subject to the regular-file, SHA-256, and SDK-version checks above, and must be
+selected before any SQL API initializes the process-wide client.

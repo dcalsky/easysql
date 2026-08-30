@@ -18,6 +18,7 @@ package easysql
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -82,6 +83,24 @@ func Init() error {
 	return err
 }
 
+// InitWithRuntimePath eagerly initializes the shared SQL engine from path.
+//
+// This entry point is intended for native-library embeddings that distribute
+// the trusted Polyglot runtime next to their own shared library and therefore
+// cannot use the Go module's source-relative lookup. The file must be a regular
+// file and must pass the same platform-specific SHA-256 and SDK version checks
+// as the bundled runtime.
+//
+// Initialization is process-wide and first-call-wins, just like Init. Callers
+// must invoke this before any SQL API when they need to select an explicit
+// runtime location. It is idempotent and safe for concurrent use.
+func InitWithRuntimePath(path string) error {
+	clientOnce.Do(func() {
+		sharedClient, sharedErr = openClient(path)
+	})
+	return sharedErr
+}
+
 // defaultClient returns the shared engine, opening it once on first use.
 func defaultClient() (*polyglot.Client, error) {
 	clientOnce.Do(func() {
@@ -107,6 +126,25 @@ func openBundledClient() (*polyglot.Client, error) {
 	path, err := bundledFFIPath()
 	if err != nil {
 		return nil, err
+	}
+	return openClient(path)
+}
+
+// openClient authenticates and opens an explicitly located Polyglot runtime.
+func openClient(path string) (*polyglot.Client, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("easysql: native runtime path must not be empty")
+	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("easysql: cannot resolve native runtime path: %w", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("easysql: cannot inspect native runtime: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("easysql: native runtime must be a regular file: %q", path)
 	}
 	if err := verifyBundledFFIIntegrity(path); err != nil {
 		return nil, err
