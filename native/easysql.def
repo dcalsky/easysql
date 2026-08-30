@@ -2,5 +2,7 @@ LIBRARY easysql.dll
 EXPORTS
     easysql_abi_version
     easysql_version
+    easysql_version_into
     easysql_execute
+    easysql_execute_into
     easysql_free_string

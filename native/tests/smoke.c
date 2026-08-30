@@ -30,6 +30,15 @@ int main(void) {
     if (version == NULL || version[0] == '\0') {
         fail("empty library version", version);
     }
+
+    size_t version_size = easysql_version_into(NULL, 0);
+    char *version_buffer = (char *)malloc(version_size);
+    if (version_buffer == NULL ||
+        easysql_version_into(version_buffer, version_size) != version_size ||
+        strcmp(version, version_buffer) != 0) {
+        fail("buffer version API mismatch", version_buffer);
+    }
+    free(version_buffer);
     easysql_free_string(version);
 
     const char *rewrite_request =
@@ -46,6 +55,17 @@ int main(void) {
         }
         easysql_free_string(response);
     }
+
+    size_t response_size = easysql_execute_into(
+        rewrite_request, strlen(rewrite_request), NULL, 0);
+    char *response_buffer = (char *)malloc(response_size);
+    if (response_buffer == NULL ||
+        easysql_execute_into(rewrite_request, strlen(rewrite_request),
+                             response_buffer, response_size) != response_size ||
+        strstr(response_buffer, "\"status\":0") == NULL) {
+        fail("buffer execute API mismatch", response_buffer);
+    }
+    free(response_buffer);
 
     char *invalid = execute("not-json");
     if (strstr(invalid, "\"status\":1") == NULL) {
