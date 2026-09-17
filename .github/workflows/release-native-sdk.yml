@@ -66,3 +66,15 @@ jobs:
           else
             gh release create "${TAG}" release-assets/* --title "${TAG}" --generate-notes
           fi
+      - name: Publish matching Go SDK module tag
+        env:
+          SDK_TAG: packages/go/${{ github.ref_name }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${SDK_TAG}" >/dev/null 2>&1; then
+            echo "Go SDK tag ${SDK_TAG} already exists"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${SDK_TAG}" -m "${SDK_TAG}"
+            git push origin "${SDK_TAG}"
+          fi

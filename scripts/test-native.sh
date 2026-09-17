@@ -64,3 +64,4 @@ esac
 )
 
 bash "${repo_root}/scripts/test-bindings.sh"
+EASYSQL_NATIVE_OUTPUT="${package_dir}" bash "${repo_root}/scripts/test-go-sdk.sh"

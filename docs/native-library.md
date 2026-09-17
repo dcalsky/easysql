@@ -85,12 +85,37 @@ const response = easysql.execute({
 });
 ```
 
-Run `npm install` in `bindings/javascript` before first use. The Go binding is
-a small cgo module under `bindings/go`; applications can reference it with a
-local `replace` directive and call `Execute` or `ExecuteJSON`. Its linker flags
-locate the library shipped in the same extracted SDK. On Windows, keep
-`easysql.dll` beside the application executable or add the SDK's `lib` directory
-to `PATH`.
+Run `npm install` in `bindings/javascript` before first use.
+
+The official Go SDK is the independent module
+`github.com/dcalsky/easysql/packages/go`. It uses PureGo, does not require cgo,
+and depends only on the separately downloaded native library rather than this
+repository's implementation source. Install the SDK and point it to the
+matching release binary:
+
+```bash
+go get github.com/dcalsky/easysql/packages/go@v0.10.5
+export EASYSQL_LIBRARY_PATH="$PWD/lib/libeasysql.so"
+```
+
+```go
+client, err := easysql.OpenDefault()
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close()
+
+query, err := client.ApplyRowFilter(
+    "SELECT id FROM orders",
+    "tenant_id = 7",
+    easysql.ApplyRowFilterOptions{Dialect: "postgres"},
+)
+```
+
+Each root release tag also publishes a matching nested Go module tag such as
+`packages/go/v0.10.5`. The older cgo binding under `bindings/go` remains an
+internal native-package smoke-test fixture; consumers should use the official
+SDK module.
 
 ## ABI
 
