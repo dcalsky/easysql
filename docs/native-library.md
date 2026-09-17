@@ -42,6 +42,19 @@ Set `EASYSQL_NATIVE_OUTPUT` to change the output directory and
 `EASYSQL_NATIVE_VERSION` to set the version returned by `easysql_version`.
 Release builds normally set the latter to the release tag.
 
+## Release archives
+
+Pushing a version tag (for example, `v0.10.3`) starts the `release-native-sdk`
+workflow. It builds and tests each supported platform, then publishes one
+`easysql-native-<platform>-<version>.tar.gz` asset per platform on the GitHub
+Release.
+
+Each archive contains only `include/` and `lib/`: it does not contain the
+repository source, license files, or the Python, JavaScript, and Go binding
+source trees. GitHub itself always displays generated `Source code (zip)` and
+`Source code (tar.gz)` links for tag-based releases; those platform-provided
+links cannot be disabled, and they are not assets uploaded by this workflow.
+
 ## Language bindings
 
 The Python binding uses only the standard library:
