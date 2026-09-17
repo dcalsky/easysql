@@ -33,7 +33,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bytedance/sonic"
 	polyglot "github.com/tobilg/polyglot/packages/go"
 )
 
@@ -1530,7 +1529,7 @@ func mergeActionName(action expr) string {
 
 // decodeNode re-encodes a decoded-JSON map and decodes it into a typed value.
 func decodeNode(node map[string]any, v any) error {
-	if err := sonic.Unmarshal(mustMarshal(node), v); err != nil {
+	if err := json.Unmarshal(mustMarshal(node), v); err != nil {
 		return fmt.Errorf("%w: %v", ErrInternal, err)
 	}
 	return nil
@@ -1551,7 +1550,7 @@ func decodeInto(e expr, v any) error {
 	if len(e) == 0 {
 		return errors.New("empty node")
 	}
-	return sonic.Unmarshal(e, v)
+	return json.Unmarshal(e, v)
 }
 
 // mustQuery decodes a raw query node ({"select"|"union"|…: …}); a malformed node
@@ -1569,7 +1568,7 @@ func decodeObj(e expr) (map[string]expr, bool) {
 		return nil, false
 	}
 	var m map[string]expr
-	if sonic.Unmarshal(e, &m) != nil {
+	if json.Unmarshal(e, &m) != nil {
 		return nil, false
 	}
 	return m, true
@@ -1581,7 +1580,7 @@ func decodeArr(e expr) []expr {
 		return nil
 	}
 	var a []expr
-	if sonic.Unmarshal(e, &a) != nil {
+	if json.Unmarshal(e, &a) != nil {
 		return nil
 	}
 	return a

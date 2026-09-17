@@ -27,12 +27,12 @@
 package easysql
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
-	"github.com/bytedance/sonic"
 	polyglot "github.com/tobilg/polyglot/packages/go"
 )
 
@@ -481,7 +481,7 @@ func parseFirstStatement(client *polyglot.Client, sql, dialect string) (map[stri
 		return nil, classifyParseError(err)
 	}
 	var stmts []any
-	if err := sonic.Unmarshal(raw, &stmts); err != nil {
+	if err := json.Unmarshal(raw, &stmts); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
 	stmts = dropNils(stmts)

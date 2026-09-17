@@ -32,7 +32,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/bytedance/sonic"
 	polyglot "github.com/tobilg/polyglot/packages/go"
 )
 
@@ -237,7 +236,7 @@ func (r *rewriter) compileWhere(whereClause string) error {
 		return fmt.Errorf("easysql: invalid where clause %q: %w", whereClause, classifyParseError(err))
 	}
 	var node map[string]any
-	if err := sonic.Unmarshal(raw, &node); err != nil {
+	if err := json.Unmarshal(raw, &node); err != nil {
 		return err
 	}
 	this, ok := dig(node, "select", "where_clause", "this")
@@ -274,7 +273,7 @@ func (r *rewriter) prepare(sql string) ([]any, []*tableDecision, error) {
 		return nil, nil, classifyParseError(err)
 	}
 	var stmts []any
-	if err := sonic.Unmarshal(raw, &stmts); err != nil {
+	if err := json.Unmarshal(raw, &stmts); err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrInternal, err)
 	}
 	stmts = dropNils(stmts)
@@ -752,8 +751,8 @@ func dropNils(in []any) []any {
 }
 
 func mustMarshal(v any) json.RawMessage {
-	b, _ := sonic.Marshal(v)
-	return b
+	b, _ := json.Marshal(v)
+	return json.RawMessage(b)
 }
 
 // ---------------------------------------------------------------------------

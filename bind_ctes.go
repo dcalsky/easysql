@@ -1,11 +1,11 @@
 package easysql
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
 	"strings"
 
-	"github.com/bytedance/sonic"
 	polyglot "github.com/tobilg/polyglot/packages/go"
 )
 
@@ -171,7 +171,7 @@ func BindCTEs(consumerSQL string, bindings []CTEBinding, opts ...BindCTEOption) 
 	}
 
 	stripASTComments(consumer)
-	raw, err := sonic.Marshal([]any{consumer})
+	raw, err := json.Marshal([]any{consumer})
 	if err != nil {
 		return "", fmt.Errorf("%w: marshal bound query: %v", ErrInternal, err)
 	}
@@ -199,7 +199,7 @@ func parseBoundQuery(client *polyglot.Client, sql, pg, label string) (map[string
 		return nil, fmt.Errorf("invalid %s SQL: %w", label, classifyParseError(err))
 	}
 	var statements []any
-	if err := sonic.Unmarshal(raw, &statements); err != nil {
+	if err := json.Unmarshal(raw, &statements); err != nil {
 		return nil, fmt.Errorf("%w: decode %s SQL: %v", ErrInternal, label, err)
 	}
 	statements = dropNils(statements)
@@ -221,7 +221,7 @@ func bindCTETemplates(client *polyglot.Client, pg string) (map[string]any, map[s
 		return nil, nil, fmt.Errorf("%w: build CTE template: %v", ErrInternal, err)
 	}
 	var statement map[string]any
-	if err := sonic.Unmarshal(raw, &statement); err != nil {
+	if err := json.Unmarshal(raw, &statement); err != nil {
 		return nil, nil, fmt.Errorf("%w: decode CTE template: %v", ErrInternal, err)
 	}
 	body := queryBody(statement)
