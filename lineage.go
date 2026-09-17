@@ -471,16 +471,14 @@ func sourceTables(client *polyglot.Client, querySQL, dialect string) ([]string, 
 
 // parseFirstStatement parses sql and returns the first statement node.
 func parseFirstStatement(client *polyglot.Client, sql, dialect string) (map[string]any, error) {
-	// All analysis APIs share this parse entry point. Keep the same native-parser
-	// safety boundary as the rewrite APIs; without it, ParseColumns and the
-	// lineage/reference APIs could accept inputs that ApplyRowFilter correctly
-	// rejects as too large or deeply nested.
+	// All analysis APIs enforce the same byte budget before native parsing.
+	// The native parser independently enforces its complexity/depth limits.
 	if err := guardInput(sql); err != nil {
 		return nil, err
 	}
 	raw, err := client.Parse(sql, dialect)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrParse, err)
+		return nil, classifyParseError(err)
 	}
 	var stmts []any
 	if err := sonic.Unmarshal(raw, &stmts); err != nil {

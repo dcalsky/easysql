@@ -1,0 +1,32 @@
+Host: macOS 15.7.9 darwin/arm64, Apple M4, Go 1.27.0
+Root tests/subtests: {'run': 670, 'output': 1396, 'pass': 669, 'skip': 1}
+Skipped: [('github.com/dcalsky/easysql', 'TestLineageDumpForDiff')]
+
+go test -race ./...
+ok  	github.com/dcalsky/easysql	4.311s
+?   	github.com/dcalsky/easysql/cmd/easysqlffi	[no test files]
+ok  	github.com/dcalsky/easysql/internal/nativeffi	2.169s
+
+bash scripts/test-native.sh
+built native package: /Users/yiheng/go/src/sql-guard/dist/native/macos-aarch64
+WARNING: sonic/ast only supports (go1.17~1.26 and amd64 CPU) or (go1.20~1.26 and arm64 CPU), but your environment is not suitable and will fallback to encoding/json
+native C ABI smoke test OK
+WARNING: sonic/ast only supports (go1.17~1.26 and amd64 CPU) or (go1.20~1.26 and arm64 CPU), but your environment is not suitable and will fallback to encoding/json
+WARNING: sonic/ast only supports (go1.17~1.26 and amd64 CPU) or (go1.20~1.26 and arm64 CPU), but your environment is not suitable and will fallback to encoding/json
+ok  	github.com/dcalsky/easysql-native-go	(cached)
+Python, JavaScript, and Go bindings OK: /Users/yiheng/go/src/sql-guard/dist/native/macos-aarch64
+
+Packaged Go binding: go test -count=1 ./...
+ok  	github.com/dcalsky/easysql-native-go	0.337s
+
+Local go-get consumer
+go: creating new go.mod: module easysql-goget-verify
+go: to add module requirements and sums:
+	go mod tidy
+verifying local checkout via replace: /Users/yiheng/go/src/sql-guard
+WARNING: sonic/ast only supports (go1.17~1.26 and amd64 CPU) or (go1.20~1.26 and arm64 CPU), but your environment is not suitable and will fallback to encoding/json
+go-get verification OK: SELECT "uid" FROM (SELECT * FROM a WHERE "user" = 'alice') AS a
+
+go vet ./...: exit 0
+git diff --check: exit 0
+Linux/amd64 and Windows/amd64: root test cross-compilation only, no runtime execution.

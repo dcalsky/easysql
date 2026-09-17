@@ -1,0 +1,11 @@
+WARNING: sonic/ast only supports (go1.17~1.26 and amd64 CPU) or (go1.20~1.26 and arm64 CPU), but your environment is not suitable and will fallback to encoding/json
+=== RUN   TestNativeOutputColumnsContract
+    polyglot_contract_test.go:21: raw output: {"columns":[{"kind":"unnamed","ordinal":0},{"kind":"wildcard","ordinal":null,"qualifier":"t","startOrdinal":1},{"kind":"named","name":"b","ordinal":null}],"ordinalComplete":false}
+--- PASS: TestNativeOutputColumnsContract (0.01s)
+=== RUN   TestNativeColumnUsesCompatibilityBoundary
+    polyglot_contract_test.go:86: raw column uses: [{"context":"filter","scopePath":"root","expressionPath":"where_clause.this","expressionSql":"amount \u003e 0","references":[{"sourceName":"orders","sourceAlias":null,"sourceKind":"table","table":"orders","column":"amount","unqualified":true,"confidence":"resolved","span":{"start":73,"end":79}}]}]
+--- PASS: TestNativeColumnUsesCompatibilityBoundary (0.00s)
+=== RUN   TestNativeParserDepthAndEOFContract
+--- PASS: TestNativeParserDepthAndEOFContract (0.00s)
+PASS
+ok  	github.com/dcalsky/easysql	0.542s

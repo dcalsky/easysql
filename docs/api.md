@@ -131,6 +131,13 @@ inferred names.
 | `CREATE TABLE ... (LIKE t)` | Requires metadata for `t`. |
 | `INSERT INTO t VALUES (...)` without target columns | `ErrUnsupported`. |
 
+`ParseColumns` uses the native output-column inspection APIs. Explicit
+projection order (including CTE/derived-table order) and duplicate aliases are
+preserved; name-aligned set operations follow the selected dialect. Metadata
+is used for unresolved wildcard expansion. Empty table metadata keeps the
+existing easysql meaning of zero columns, even though the native schema API
+uses an empty column list to mean unknown/open.
+
 ## ReferencedColumns
 
 ```go

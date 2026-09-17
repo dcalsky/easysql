@@ -117,8 +117,8 @@ var invariantCorpus = []struct{ dialect, sql string }{
 }
 
 func TestInputGuard(t *testing.T) {
-	deepFunc := "select s" + strings.Repeat("(", 300) + "1" + strings.Repeat(")", 300) + " from a"
-	deepCurly := "select " + strings.Repeat("{", 300) + "1" + strings.Repeat("}", 300) + " from a"
+	deepFunc := "select s" + strings.Repeat("(", 4000) + "1" + strings.Repeat(")", 4000) + " from a"
+	deepUnary := "select " + strings.Repeat("~ ", 4000) + "1 from a"
 	huge := "select * from a where x in (" + strings.Repeat("1,", maxInputBytes) + "1)"
 
 	for _, tc := range []struct {
@@ -126,7 +126,7 @@ func TestInputGuard(t *testing.T) {
 		sql  string
 	}{
 		{"deep function nesting", deepFunc},
-		{"deep curly nesting", deepCurly},
+		{"deep unary nesting", deepUnary},
 		{"oversized input", huge},
 	} {
 		t.Run("rejected/"+tc.name, func(t *testing.T) {
@@ -140,7 +140,8 @@ func TestInputGuard(t *testing.T) {
 	// Brackets inside string literals must not trip the guard: valid SQL is
 	// accepted and rewritten.
 	for _, tc := range []string{
-		"select '((((((((((' from a",
+		"select '" + strings.Repeat("(", 300) + "' from a",
+		"select /* " + strings.Repeat("{", 300) + " */ id from a",
 		"select * from a where note = '{a:{b:{c}}}'",
 		"select * from a where x in (1, (2), ((3)))",
 	} {
@@ -153,8 +154,8 @@ func TestInputGuard(t *testing.T) {
 }
 
 func TestInputGuardCoversEveryPublicParsePath(t *testing.T) {
-	deepExpr := strings.Repeat("(", maxBracketDepth+1) + "1" +
-		strings.Repeat(")", maxBracketDepth+1)
+	deepExpr := strings.Repeat("(", 4000) + "1" +
+		strings.Repeat(")", 4000)
 	deepSQL := "SELECT " + deepExpr + " FROM s.t"
 
 	checks := []struct {

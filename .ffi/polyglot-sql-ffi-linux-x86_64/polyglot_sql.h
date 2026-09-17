@@ -310,6 +310,20 @@ polyglot_result_t polyglot_transpile_with_options(const char *sql,
                                                   const char *options_json);
 
 /**
+ * Validate SQL against a ValidationSchema JSON object using the shared Rust engine.
+ *
+ * All arguments must be non-NULL, UTF-8, NUL-terminated strings. Pass "{}" for
+ * default options. SchemaValidationOptions accepts snake_case option names
+ * (check_types, check_references, strict, semantic, strict_syntax), with
+ * camelCase aliases for the compound names. Unknown options are rejected.
+ * Free the returned payload with polyglot_free_validation_result.
+ */
+polyglot_validation_result_t polyglot_validate_with_schema(const char *sql,
+                                                           const char *schema_json,
+                                                           const char *dialect,
+                                                           const char *options_json);
+
+/**
  * Validate SQL syntax for a dialect.
  */
 polyglot_validation_result_t polyglot_validate(const char *sql, const char *dialect);

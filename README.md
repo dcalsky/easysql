@@ -117,3 +117,4 @@ uses, err := easysql.ReferencedColumnUsages(
 - [Native runtime](docs/native-runtime.md)
 - [Native SDK (Python, JavaScript, Go)](docs/native-library.md)
 - [Development](docs/development.md)
+- [Polyglot v0.11.0 refactor and benchmarks](docs/benchmarks/polyglot-v0.11.0/README.md)

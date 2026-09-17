@@ -9,5 +9,5 @@ var bundledRuntimeArtifact []byte
 
 const (
 	bundledRuntimeFileName = "easysql_engine.dll"
-	bundledRuntimeSHA256   = "dae7e6bbc0f6afb390ff91472107b47999a5c508b94ac1963250f73961008ee9"
+	bundledRuntimeSHA256   = "4ba724884739b0a0d789dd0c774a3e3a8e886d3a6fd4edaf39ea3c79654c772f"
 )
