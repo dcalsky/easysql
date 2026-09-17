@@ -1,0 +1,186 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/dcalsky/easysql
+cpu: Apple M4
+BenchmarkAnalysis/ParseColumns/simple-10         	    1256	    188051 ns/op	   41643 B/op	     419 allocs/op
+BenchmarkAnalysis/ParseColumns/star-10           	     764	    295634 ns/op	   70862 B/op	     688 allocs/op
+BenchmarkAnalysis/ParseColumns/cte-10            	     400	    594106 ns/op	  136529 B/op	    1240 allocs/op
+BenchmarkAnalysis/ParseColumns/union-10          	     702	    396469 ns/op	   75522 B/op	     668 allocs/op
+BenchmarkAnalysis/ReferencedColumns/simple-10    	    2167	    111114 ns/op	   82646 B/op	     689 allocs/op
+BenchmarkAnalysis/ReferencedColumns/star-10      	    1594	    145737 ns/op	  126361 B/op	     905 allocs/op
+BenchmarkAnalysis/ReferencedColumns/cte-10       	     775	    497089 ns/op	  303540 B/op	    2089 allocs/op
+BenchmarkAnalysis/ReferencedColumns/union-10     	     823	    251574 ns/op	  144077 B/op	    1113 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/simple-10         	    2487	    109272 ns/op	   83008 B/op	     692 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/star-10           	    1813	    141961 ns/op	  126860 B/op	     907 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/cte-10            	     758	    326344 ns/op	  304996 B/op	    2094 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/union-10          	    1542	    162504 ns/op	  144492 B/op	    1117 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/simple-10           	     988	    222969 ns/op	   47606 B/op	     465 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/star-10             	     871	    285311 ns/op	   77447 B/op	     714 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/cte-10              	     313	    821673 ns/op	  144478 B/op	    1295 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/union-10            	     529	    466946 ns/op	   81672 B/op	     709 allocs/op
+BenchmarkRewrite/simple-10                                 	    3134	     73688 ns/op	   42461 B/op	     301 allocs/op
+BenchmarkRewrite/two_join-10                               	    1209	    195056 ns/op	  114730 B/op	     871 allocs/op
+BenchmarkRewrite/three_join-10                             	     864	    287728 ns/op	  162016 B/op	    1232 allocs/op
+BenchmarkRewrite/left_join-10                              	    1438	    179286 ns/op	  102946 B/op	     719 allocs/op
+BenchmarkRewrite/subquery_from-10                          	    1231	    192452 ns/op	  117042 B/op	     819 allocs/op
+BenchmarkRewrite/cte-10                                    	    1184	    202165 ns/op	  119545 B/op	     872 allocs/op
+BenchmarkRewrite/union-10                                  	    1690	    140076 ns/op	   84840 B/op	     550 allocs/op
+BenchmarkRewrite/scalar_subquery-10                        	    1113	    238516 ns/op	  121658 B/op	     914 allocs/op
+BenchmarkRewrite/schema_qualified-10                       	    1023	    205978 ns/op	  123756 B/op	     995 allocs/op
+BenchmarkRewrite/analytical-10                             	     496	    469649 ns/op	  246889 B/op	    1976 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/dcalsky/easysql
+cpu: Apple M4
+BenchmarkAnalysis/ParseColumns/simple-10         	    1281	    183466 ns/op	   41690 B/op	     420 allocs/op
+BenchmarkAnalysis/ParseColumns/star-10           	     715	    298564 ns/op	   70814 B/op	     688 allocs/op
+BenchmarkAnalysis/ParseColumns/cte-10            	     393	    578920 ns/op	  136696 B/op	    1240 allocs/op
+BenchmarkAnalysis/ParseColumns/union-10          	     696	    337597 ns/op	   75451 B/op	     667 allocs/op
+BenchmarkAnalysis/ReferencedColumns/simple-10    	    2583	     88551 ns/op	   82670 B/op	     689 allocs/op
+BenchmarkAnalysis/ReferencedColumns/star-10      	    1834	    132496 ns/op	  126315 B/op	     905 allocs/op
+BenchmarkAnalysis/ReferencedColumns/cte-10       	     756	    309129 ns/op	  303686 B/op	    2090 allocs/op
+BenchmarkAnalysis/ReferencedColumns/union-10     	    1533	    155505 ns/op	  144086 B/op	    1113 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/simple-10         	    2626	     95802 ns/op	   83014 B/op	     692 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/star-10           	    1698	    144051 ns/op	  126867 B/op	     907 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/cte-10            	     720	    312873 ns/op	  304823 B/op	    2093 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/union-10          	    1554	    156235 ns/op	  144565 B/op	    1117 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/simple-10           	     864	    239686 ns/op	   47600 B/op	     465 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/star-10             	     841	    289595 ns/op	   77421 B/op	     713 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/cte-10              	     313	    751678 ns/op	  144592 B/op	    1293 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/union-10            	     543	    434147 ns/op	   81570 B/op	     708 allocs/op
+BenchmarkRewrite/simple-10                                 	    3171	     71875 ns/op	   42492 B/op	     301 allocs/op
+BenchmarkRewrite/two_join-10                               	    1237	    194531 ns/op	  114709 B/op	     871 allocs/op
+BenchmarkRewrite/three_join-10                             	     874	    291456 ns/op	  161963 B/op	    1232 allocs/op
+BenchmarkRewrite/left_join-10                              	    1460	    160061 ns/op	  102867 B/op	     719 allocs/op
+BenchmarkRewrite/subquery_from-10                          	    1130	    195039 ns/op	  116989 B/op	     820 allocs/op
+BenchmarkRewrite/cte-10                                    	    1177	    207248 ns/op	  119668 B/op	     872 allocs/op
+BenchmarkRewrite/union-10                                  	    1689	    141475 ns/op	   84686 B/op	     550 allocs/op
+BenchmarkRewrite/scalar_subquery-10                        	    1112	    213225 ns/op	  121569 B/op	     914 allocs/op
+BenchmarkRewrite/schema_qualified-10                       	    1186	    203751 ns/op	  123867 B/op	     995 allocs/op
+BenchmarkRewrite/analytical-10                             	     536	    439505 ns/op	  246725 B/op	    1977 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/dcalsky/easysql
+cpu: Apple M4
+BenchmarkAnalysis/ParseColumns/simple-10         	    1340	    168723 ns/op	   41633 B/op	     419 allocs/op
+BenchmarkAnalysis/ParseColumns/star-10           	     792	    304328 ns/op	   70846 B/op	     688 allocs/op
+BenchmarkAnalysis/ParseColumns/cte-10            	     387	    628091 ns/op	  136655 B/op	    1241 allocs/op
+BenchmarkAnalysis/ParseColumns/union-10          	     668	    349782 ns/op	   75483 B/op	     667 allocs/op
+BenchmarkAnalysis/ReferencedColumns/simple-10    	    2552	     96488 ns/op	   82646 B/op	     689 allocs/op
+BenchmarkAnalysis/ReferencedColumns/star-10      	    1608	    147614 ns/op	  126331 B/op	     905 allocs/op
+BenchmarkAnalysis/ReferencedColumns/cte-10       	     742	    317448 ns/op	  304242 B/op	    2091 allocs/op
+BenchmarkAnalysis/ReferencedColumns/union-10     	    1513	    159402 ns/op	  144173 B/op	    1114 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/simple-10         	    2530	     95763 ns/op	   83039 B/op	     692 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/star-10           	    1557	    144818 ns/op	  126843 B/op	     907 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/cte-10            	     739	    337191 ns/op	  304246 B/op	    2092 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/union-10          	    1418	    162369 ns/op	  144443 B/op	    1116 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/simple-10           	    1064	    223376 ns/op	   47549 B/op	     465 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/star-10             	     847	    329800 ns/op	   77457 B/op	     714 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/cte-10              	     297	    864356 ns/op	  145034 B/op	    1295 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/union-10            	     463	    509968 ns/op	   81796 B/op	     709 allocs/op
+BenchmarkRewrite/simple-10                                 	    3032	     80717 ns/op	   42427 B/op	     300 allocs/op
+BenchmarkRewrite/two_join-10                               	    1135	    205903 ns/op	  114586 B/op	     871 allocs/op
+BenchmarkRewrite/three_join-10                             	     828	    294045 ns/op	  162083 B/op	    1232 allocs/op
+BenchmarkRewrite/left_join-10                              	    1372	    174169 ns/op	  102900 B/op	     719 allocs/op
+BenchmarkRewrite/subquery_from-10                          	    1202	    198098 ns/op	  116968 B/op	     820 allocs/op
+BenchmarkRewrite/cte-10                                    	    1125	    209488 ns/op	  119514 B/op	     872 allocs/op
+BenchmarkRewrite/union-10                                  	    1641	    146161 ns/op	   84770 B/op	     550 allocs/op
+BenchmarkRewrite/scalar_subquery-10                        	    1071	    221685 ns/op	  121528 B/op	     914 allocs/op
+BenchmarkRewrite/schema_qualified-10                       	    1113	    212793 ns/op	  123813 B/op	     994 allocs/op
+BenchmarkRewrite/analytical-10                             	     501	    458605 ns/op	  246624 B/op	    1975 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/dcalsky/easysql
+cpu: Apple M4
+BenchmarkAnalysis/ParseColumns/simple-10         	    1402	    164211 ns/op	   41648 B/op	     419 allocs/op
+BenchmarkAnalysis/ParseColumns/star-10           	     800	    338861 ns/op	   70826 B/op	     687 allocs/op
+BenchmarkAnalysis/ParseColumns/cte-10            	     390	    592908 ns/op	  136295 B/op	    1239 allocs/op
+BenchmarkAnalysis/ParseColumns/union-10          	     705	    331730 ns/op	   75498 B/op	     667 allocs/op
+BenchmarkAnalysis/ReferencedColumns/simple-10    	    2472	     90193 ns/op	   82636 B/op	     689 allocs/op
+BenchmarkAnalysis/ReferencedColumns/star-10      	    1712	    135200 ns/op	  126307 B/op	     905 allocs/op
+BenchmarkAnalysis/ReferencedColumns/cte-10       	     772	    308819 ns/op	  304066 B/op	    2091 allocs/op
+BenchmarkAnalysis/ReferencedColumns/union-10     	    1539	    154499 ns/op	  144129 B/op	    1114 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/simple-10         	    2662	     95694 ns/op	   83097 B/op	     692 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/star-10           	    1778	    141114 ns/op	  126885 B/op	     907 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/cte-10            	     770	    312052 ns/op	  304559 B/op	    2093 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/union-10          	    1550	    155354 ns/op	  144540 B/op	    1117 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/simple-10           	    1112	    211215 ns/op	   47550 B/op	     465 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/star-10             	     896	    285608 ns/op	   77485 B/op	     714 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/cte-10              	     298	    769128 ns/op	  144796 B/op	    1295 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/union-10            	     534	    431453 ns/op	   81652 B/op	     709 allocs/op
+BenchmarkRewrite/simple-10                                 	    3129	     71931 ns/op	   42447 B/op	     301 allocs/op
+BenchmarkRewrite/two_join-10                               	    1224	    265025 ns/op	  114725 B/op	     871 allocs/op
+BenchmarkRewrite/three_join-10                             	     738	    304047 ns/op	  161841 B/op	    1231 allocs/op
+BenchmarkRewrite/left_join-10                              	    1428	    173847 ns/op	  102845 B/op	     719 allocs/op
+BenchmarkRewrite/subquery_from-10                          	    1224	    193575 ns/op	  116923 B/op	     820 allocs/op
+BenchmarkRewrite/cte-10                                    	    1171	    202043 ns/op	  119504 B/op	     872 allocs/op
+BenchmarkRewrite/union-10                                  	    1713	    140309 ns/op	   84831 B/op	     550 allocs/op
+BenchmarkRewrite/scalar_subquery-10                        	    1142	    210644 ns/op	  121689 B/op	     914 allocs/op
+BenchmarkRewrite/schema_qualified-10                       	    1186	    198384 ns/op	  123689 B/op	     994 allocs/op
+BenchmarkRewrite/analytical-10                             	     541	    435971 ns/op	  246408 B/op	    1975 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/dcalsky/easysql
+cpu: Apple M4
+BenchmarkAnalysis/ParseColumns/simple-10         	    1395	    161446 ns/op	   41658 B/op	     419 allocs/op
+BenchmarkAnalysis/ParseColumns/star-10           	     831	    288353 ns/op	   70923 B/op	     688 allocs/op
+BenchmarkAnalysis/ParseColumns/cte-10            	     409	    572086 ns/op	  136695 B/op	    1240 allocs/op
+BenchmarkAnalysis/ParseColumns/union-10          	     709	    335180 ns/op	   75492 B/op	     667 allocs/op
+BenchmarkAnalysis/ReferencedColumns/simple-10    	    2618	     87244 ns/op	   82660 B/op	     689 allocs/op
+BenchmarkAnalysis/ReferencedColumns/star-10      	    1836	    132297 ns/op	  126281 B/op	     905 allocs/op
+BenchmarkAnalysis/ReferencedColumns/cte-10       	     772	    308282 ns/op	  304220 B/op	    2091 allocs/op
+BenchmarkAnalysis/ReferencedColumns/union-10     	    1598	    153074 ns/op	  144163 B/op	    1114 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/simple-10         	    2684	     91137 ns/op	   83054 B/op	     692 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/star-10           	    1740	    136021 ns/op	  126976 B/op	     907 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/cte-10            	     771	    310252 ns/op	  304650 B/op	    2093 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/union-10          	    1546	    155319 ns/op	  144546 B/op	    1117 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/simple-10           	    1104	    210817 ns/op	   47573 B/op	     465 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/star-10             	     891	    267369 ns/op	   77408 B/op	     714 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/cte-10              	     313	    759847 ns/op	  144671 B/op	    1294 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/union-10            	     550	    432653 ns/op	   81576 B/op	     708 allocs/op
+BenchmarkRewrite/simple-10                                 	    3195	     71397 ns/op	   42485 B/op	     301 allocs/op
+BenchmarkRewrite/two_join-10                               	    1209	    192605 ns/op	  114797 B/op	     872 allocs/op
+BenchmarkRewrite/three_join-10                             	     879	    272891 ns/op	  161867 B/op	    1231 allocs/op
+BenchmarkRewrite/left_join-10                              	    1489	    162479 ns/op	  103149 B/op	     720 allocs/op
+BenchmarkRewrite/subquery_from-10                          	    1234	    192169 ns/op	  116916 B/op	     820 allocs/op
+BenchmarkRewrite/cte-10                                    	    1195	    201969 ns/op	  119459 B/op	     871 allocs/op
+BenchmarkRewrite/union-10                                  	    1684	    140980 ns/op	   84879 B/op	     550 allocs/op
+BenchmarkRewrite/scalar_subquery-10                        	    1124	    212092 ns/op	  121536 B/op	     914 allocs/op
+BenchmarkRewrite/schema_qualified-10                       	    1189	    201011 ns/op	  123945 B/op	     995 allocs/op
+BenchmarkRewrite/analytical-10                             	     546	    437688 ns/op	  246673 B/op	    1976 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/dcalsky/easysql
+cpu: Apple M4
+BenchmarkAnalysis/ParseColumns/simple-10         	    1386	    161463 ns/op	   41622 B/op	     419 allocs/op
+BenchmarkAnalysis/ParseColumns/star-10           	     813	    286283 ns/op	   70850 B/op	     688 allocs/op
+BenchmarkAnalysis/ParseColumns/cte-10            	     410	    572751 ns/op	  136642 B/op	    1240 allocs/op
+BenchmarkAnalysis/ParseColumns/union-10          	     709	    334457 ns/op	   75472 B/op	     667 allocs/op
+BenchmarkAnalysis/ReferencedColumns/simple-10    	    2617	     86776 ns/op	   82589 B/op	     688 allocs/op
+BenchmarkAnalysis/ReferencedColumns/star-10      	    1844	    131811 ns/op	  126334 B/op	     905 allocs/op
+BenchmarkAnalysis/ReferencedColumns/cte-10       	     776	    308123 ns/op	  304198 B/op	    2090 allocs/op
+BenchmarkAnalysis/ReferencedColumns/union-10     	    1550	    153760 ns/op	  144167 B/op	    1114 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/simple-10         	    2598	     91407 ns/op	   83076 B/op	     692 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/star-10           	    1746	    135871 ns/op	  126882 B/op	     907 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/cte-10            	     768	    310003 ns/op	  304473 B/op	    2093 allocs/op
+BenchmarkAnalysis/ReferencedColumnUsages/union-10          	    1543	    155346 ns/op	  144513 B/op	    1117 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/simple-10           	    1131	    211198 ns/op	   47572 B/op	     465 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/star-10             	     886	    264339 ns/op	   77416 B/op	     713 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/cte-10              	     315	    743598 ns/op	  144291 B/op	    1294 allocs/op
+BenchmarkAnalysis/LineageSourceColumns/union-10            	     549	    430619 ns/op	   81598 B/op	     708 allocs/op
+BenchmarkRewrite/simple-10                                 	    3222	     71079 ns/op	   42470 B/op	     301 allocs/op
+BenchmarkRewrite/two_join-10                               	    1240	    192127 ns/op	  114751 B/op	     872 allocs/op
+BenchmarkRewrite/three_join-10                             	     874	    272290 ns/op	  162025 B/op	    1232 allocs/op
+BenchmarkRewrite/left_join-10                              	    1465	    162541 ns/op	  103084 B/op	     719 allocs/op
+BenchmarkRewrite/subquery_from-10                          	    1245	    192233 ns/op	  117066 B/op	     820 allocs/op
+BenchmarkRewrite/cte-10                                    	    1186	    202276 ns/op	  119529 B/op	     871 allocs/op
+BenchmarkRewrite/union-10                                  	    1701	    140268 ns/op	   84778 B/op	     550 allocs/op
+BenchmarkRewrite/scalar_subquery-10                        	    1123	    213145 ns/op	  121486 B/op	     913 allocs/op
+BenchmarkRewrite/schema_qualified-10                       	    1179	    200217 ns/op	  123813 B/op	     995 allocs/op
+BenchmarkRewrite/analytical-10                             	     538	    437375 ns/op	  246482 B/op	    1976 allocs/op
+PASS

@@ -196,7 +196,7 @@ func parseBoundQuery(client *polyglot.Client, sql, pg, label string) (map[string
 	}
 	raw, err := client.Parse(sql, pg)
 	if err != nil {
-		return nil, fmt.Errorf("%w: invalid %s SQL: %v", ErrParse, label, err)
+		return nil, fmt.Errorf("invalid %s SQL: %w", label, classifyParseError(err))
 	}
 	var statements []any
 	if err := sonic.Unmarshal(raw, &statements); err != nil {

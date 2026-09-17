@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/bytedance/sonic v1.15.2
-	github.com/tobilg/polyglot/packages/go v0.9.0
+	github.com/tobilg/polyglot/packages/go v0.11.0
 )
 
 require (

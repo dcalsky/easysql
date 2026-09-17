@@ -227,16 +227,14 @@ func compile(client *polyglot.Client, whereClause string, opts ...Option) (*rewr
 // compileWhere validates whereClause (it must be a boolean expression) and
 // stores its trimmed text for the immutable builder plan.
 func (r *rewriter) compileWhere(whereClause string) error {
-	// The predicate reaches the same native recursive-descent parser as the
-	// statement itself. Guard it independently: a short SELECT can otherwise
-	// smuggle a pathologically deep or oversized predicate past prepare's input
-	// check and crash (or exhaust) the native parser before Go can recover.
+	// Bound predicate bytes independently of the statement. Native parsing
+	// applies its own complexity and recursion limits to the complete input.
 	if err := guardInput(whereClause); err != nil {
 		return fmt.Errorf("easysql: unsafe where clause: %w", err)
 	}
 	raw, err := r.client.ParseOne("SELECT 1 WHERE "+whereClause, r.pg)
 	if err != nil {
-		return fmt.Errorf("easysql: invalid where clause %q: %w", whereClause, err)
+		return fmt.Errorf("easysql: invalid where clause %q: %w", whereClause, classifyParseError(err))
 	}
 	var node map[string]any
 	if err := sonic.Unmarshal(raw, &node); err != nil {
@@ -266,17 +264,14 @@ func (r *rewriter) prepare(sql string) ([]any, []*tableDecision, error) {
 		sql = r.normalize(sql)
 	}
 
-	// Reject pathologically large or deeply nested input before touching the
-	// FFI: polyglot's native recursive-descent parser can stack-overflow and
-	// crash the whole process on deep expression nesting (which Go cannot
-	// recover from). Fail closed instead.
+	// Enforce the byte budget before FFI; native parsing enforces depth limits.
 	if err := guardInput(sql); err != nil {
 		return nil, nil, err
 	}
 
 	raw, err := r.client.Parse(sql, r.pg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", ErrParse, err)
+		return nil, nil, classifyParseError(err)
 	}
 	var stmts []any
 	if err := sonic.Unmarshal(raw, &stmts); err != nil {
@@ -624,44 +619,28 @@ func sortedKeys(m map[string]any) []string {
 // Input guard
 // ---------------------------------------------------------------------------
 
-const (
-	// maxInputBytes bounds total work and rules out adversarial giant inputs.
-	maxInputBytes = 1 << 20 // 1 MiB
-	// maxBracketDepth is a conservative cap on the nesting of grouping
-	// brackets. Polyglot's native recursive-descent parser stack-overflows on
-	// deeply nested expressions -- e.g. function calls (...), or {...}/[...]
-	// constructs -- and the crash (observed > ~150 here) cannot be recovered in
-	// Go. The cap stays well below the crash point yet far above any sane query.
-	maxBracketDepth = 64
-)
+// maxInputBytes bounds total work independently of the native parser guard.
+const maxInputBytes = 1 << 20 // 1 MiB
 
-// guardInput fails closed (ErrUnsupported) on input that could crash or stall
-// the native parser. It is a heuristic scan over the raw text (it does not skip
-// string/comment contents) that bounds the nesting of all grouping bracket
-// families, which can only cause a safe false rejection of bizarre input, never
-// an unsafe rewrite.
+// Polyglot v0.11 protects parser recursion in every native parse entry point,
+// including unary/IF chains without brackets. Keep only the API's byte budget
+// here; scanning raw brackets incorrectly rejected quoted strings and comments.
 func guardInput(sql string) error {
 	if len(sql) > maxInputBytes {
 		return fmt.Errorf("%w: input too large (%d bytes)", ErrUnsupported, len(sql))
 	}
-	depth, max := 0, 0
-	for _, c := range sql {
-		switch c {
-		case '(', '[', '{':
-			depth++
-			if depth > max {
-				max = depth
-			}
-		case ')', ']', '}':
-			if depth > 0 {
-				depth--
-			}
-		}
-	}
-	if max > maxBracketDepth {
-		return fmt.Errorf("%w: input nesting too deep (%d levels)", ErrUnsupported, max)
-	}
 	return nil
+}
+
+// Native guard failures remain ErrUnsupported, as input-limit failures were
+// before v0.11. Ordinary syntax errors retain ErrParse. The SDK exposes the
+// guard's stable diagnostic code through Error.Message, not a Go sentinel.
+func classifyParseError(err error) error {
+	var native *polyglot.Error
+	if errors.As(err, &native) && strings.Contains(native.Message, "E_GUARD_") {
+		return fmt.Errorf("%w: %w", ErrUnsupported, err)
+	}
+	return fmt.Errorf("%w: %w", ErrParse, err)
 }
 
 // ---------------------------------------------------------------------------

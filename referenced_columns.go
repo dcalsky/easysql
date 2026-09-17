@@ -6,9 +6,10 @@
 // it: a column appearing only in a filter position is included here but not
 // there.
 //
-// Unlike the lineage analyzer, the native engine does not expose the source
-// table of a filter-position column, so resolution is done structurally on the
-// parsed AST. A small recursive resolver walks each query scope, maps every
+// Polyglot v0.10+ exposes non-projection columnUses, but those facts omit
+// inner projection references that do not reach the final output and do not
+// implement this API's DML and fail-open contracts. Resolution therefore still
+// uses the parsed AST. A recursive resolver walks each query scope, maps every
 // table/alias in its FROM and JOINs to a source (a physical table, or — for a
 // CTE or derived subquery — the recursively resolved output→root-table mapping
 // of its body), then attributes each referenced column to its root physical

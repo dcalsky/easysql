@@ -9,5 +9,5 @@ var bundledRuntimeArtifact []byte
 
 const (
 	bundledRuntimeFileName = "libeasysql_engine.so"
-	bundledRuntimeSHA256   = "357f00115ccd3b276a8395e7072a1909b7a73f70c6ea6e636979932c7ec2c1ef"
+	bundledRuntimeSHA256   = "52d5362b80964bd8f6497e861215bf02e8ede5ab8efed05bd59947a53d1a60ad"
 )
