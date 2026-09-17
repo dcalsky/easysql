@@ -1,9 +1,9 @@
 package easysql
 
 import (
+	"encoding/json"
 	"fmt"
 
-	"github.com/bytedance/sonic"
 	polyglot "github.com/tobilg/polyglot/packages/go"
 )
 
@@ -18,7 +18,7 @@ func buildSubquery(client *polyglot.Client, expression polyglot.Expression, cont
 		return nil, fmt.Errorf("%w: %s: %v", ErrInternal, context, err)
 	}
 	var node map[string]any
-	if err := sonic.Unmarshal(raw, &node); err != nil {
+	if err := json.Unmarshal(raw, &node); err != nil {
 		return nil, fmt.Errorf("%w: decode %s: %v", ErrInternal, context, err)
 	}
 	subquery, ok := node["subquery"].(map[string]any)
