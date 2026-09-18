@@ -46,7 +46,7 @@ rm -f \
 
 native_version="${EASYSQL_NATIVE_VERSION:-}"
 if [[ -z "${native_version}" ]]; then
-  native_version="$(git -C "${repo_root}" describe --tags --always --dirty 2>/dev/null || echo dev)"
+  native_version="$(git -C "${repo_root}" describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/null || echo dev)"
 fi
 if [[ ! "${native_version}" =~ ^[0-9A-Za-z._+-]+$ ]]; then
   echo "invalid EASYSQL_NATIVE_VERSION: use only letters, digits, dot, underscore, plus, and hyphen" >&2

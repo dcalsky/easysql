@@ -35,6 +35,34 @@ func main() {
 Call `easysql.Init()` at startup when the application should verify the bundled
 runtime before serving requests.
 
+## Binary-only Go SDK
+
+Applications that should not compile or depend on the easysql implementation
+source can use the separate PureGo SDK with a matching native release binary:
+
+```bash
+go get github.com/dcalsky/easysql/packages/go@v0.10.5
+export EASYSQL_LIBRARY_PATH="$PWD/lib/libeasysql.so"
+```
+
+```go
+client, err := easysql.OpenDefault()
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close()
+
+sql, err := client.ApplyRowFilter(
+    "SELECT id FROM orders",
+    "tenant_id = 7",
+    easysql.ApplyRowFilterOptions{Dialect: "postgres"},
+)
+```
+
+The SDK module is `github.com/dcalsky/easysql/packages/go`; it loads the
+`.so`, `.dylib`, or `.dll` at runtime without cgo. See the
+[Go SDK guide](packages/go/README.md).
+
 ## Examples
 
 ### BindCTEs
