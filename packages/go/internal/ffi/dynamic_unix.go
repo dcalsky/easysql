@@ -21,10 +21,9 @@ func (library *dynamicLibrary) lookup(name string) (uintptr, error) {
 }
 
 func (library *dynamicLibrary) close() error {
-	if library == nil || library.handle == 0 {
-		return nil
-	}
-	err := purego.Dlclose(library.handle)
-	library.handle = 0
-	return err
+	// easysql is built with Go's c-shared mode and owns process runtime state.
+	// Unloading it and opening it again can deadlock in dyld on macOS, so keep
+	// the loader reference pinned until process exit. Client.Close still marks
+	// the client closed and prevents any subsequent calls through it.
+	return nil
 }

@@ -64,7 +64,9 @@ go run .
 `OpenDefault` also checks for the platform library in the current directory,
 its `lib/` subdirectory, the executable directory, and the executable's `lib/`
 subdirectory. `Open(path)` is recommended when the application controls its
-installation layout.
+installation layout. `Client.Close` prevents further calls through that client;
+the Go `c-shared` runtime remains loaded until process exit because unloading
+and reopening a Go shared library is not supported reliably across platforms.
 
 ## API
 
